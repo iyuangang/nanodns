@@ -17,7 +17,7 @@ A lightweight, zero-dependency DNS server for internal networks — configured w
 ## Installation
 
 ```bash
-pip install nanodns-server
+pip install nanodns
 ```
 
 ## Quick Start

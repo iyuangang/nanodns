@@ -3,8 +3,8 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "nanodns-server"
-version = "0.1.0"
+name = "nanodns"
+version = "0.1.1"
 description = "A lightweight, JSON-configurable DNS server for internal networks"
 readme = "README.md"
 license = { text = "MIT" }
@@ -32,8 +32,8 @@ dependencies = []
 nanodns = "nanodns.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/yourname/nanodns"
-Issues = "https://github.com/yourname/nanodns/issues"
+Homepage = "https://github.com/iyuangang/nanodns"
+Issues = "https://github.com/iyuangang/nanodns/issues"
 
 [tool.setuptools.packages]
 find = {}
