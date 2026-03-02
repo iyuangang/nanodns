@@ -12,7 +12,7 @@ RUN pip install --upgrade pip build \
 RUN python -m pip install --no-cache-dir \
  --prefix=/install \
  /build/dist/*.whl
- 
+RUN ls /install
 # Default config generation
 RUN /install/nanodns init /etc/nanodns.json
 
