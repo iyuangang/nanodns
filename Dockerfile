@@ -12,9 +12,12 @@ RUN pip install --upgrade pip build \
 RUN python -m pip install --no-cache-dir \
  --prefix=/install \
  /build/dist/*.whl
-RUN ls /install/bin
+
+RUN python -m pip install --no-cache-dir \
+ /build/dist/*.whl
+
 # Default config generation
-RUN /install/bin/nanodns init /etc/nanodns.json
+RUN nanodns init /etc/nanodns.json
 
 # ─── Stage 2: Chainguard Runtime ───────────────────────────────────
 FROM cgr.dev/chainguard/python:latest
