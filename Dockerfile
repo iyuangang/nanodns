@@ -8,6 +8,10 @@ COPY nanodns/ ./nanodns/
 
 RUN pip install --upgrade pip build \
  && python -m build --wheel --outdir /build/dist
+ 
+RUN python -m pip install --no-cache-dir \
+ --prefix=/install \
+ /build/dist/*.whl
 
 
 # ─── Stage 2: Chainguard Runtime ───────────────────────────────────
@@ -26,12 +30,8 @@ LABEL org.opencontainers.image.title="NanoDNS" \
       org.opencontainers.image.source="${REPO_URL}" \
       org.opencontainers.image.licenses="MIT"
 
-# Copy wheel
-COPY --from=builder /build/dist/*.whl /tmp/
-
-# Install into minimal runtime
-RUN python -m pip install --no-cache-dir /tmp/*.whl \
- && rm /tmp/*.whl
+# Copy installed packages
+COPY --from=builder /install /usr/local
 
 # Create config directory
 WORKDIR /etc/nanodns
@@ -41,6 +41,8 @@ RUN mkdir -p /etc/nanodns
 RUN nanodns init /etc/nanodns/nanodns.json
 
 EXPOSE 53/udp
+
+USER root
 
 ENTRYPOINT ["nanodns"]
 CMD ["start","--config","/etc/nanodns/nanodns.json"]
