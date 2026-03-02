@@ -40,3 +40,33 @@ find = {}
 
 [tool.setuptools.package-dir]
 "" = "."
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+markers = [
+    "unit: pure unit tests, no network",
+    "integration: requires a live UDP server",
+    "slow: tests that take more than 1 second",
+]
+
+[tool.coverage.run]
+source = ["nanodns"]
+omit = [
+    "tests/*",
+    "nanodns/__init__.py",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+fail_under = 80
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+    "\\.\\.\\.",
+]
+
+[tool.coverage.html]
+directory = "htmlcov"
