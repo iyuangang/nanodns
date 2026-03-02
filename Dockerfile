@@ -11,7 +11,7 @@ RUN pip install --upgrade pip build \
 
 
 # ─── Stage 2: Chainguard Runtime ───────────────────────────────────
-FROM cgr.dev/chainguard/python:3.12
+FROM cgr.dev/chainguard/python:latest
 
 # OCI metadata args
 ARG VERSION=0.1.0
