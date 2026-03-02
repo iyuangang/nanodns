@@ -9,9 +9,7 @@ COPY nanodns/ ./nanodns/
 RUN pip install --upgrade pip build \
  && python -m build --wheel --outdir /build/dist
  
-RUN python -m pip install --no-cache-dir \
- --prefix=/install \
- /build/dist/*.whl
+
 
 RUN python -m pip install --no-cache-dir \
  /build/dist/*.whl
@@ -19,6 +17,11 @@ RUN python -m pip install --no-cache-dir \
 # Default config generation
 RUN nanodns init /etc/nanodns.json
 
+RUN python -m pip install --no-cache-dir \
+ --prefix=/install \
+ /build/dist/*.whl
+
+ RUN ls -lah /install/bin
 # ─── Stage 2: Chainguard Runtime ───────────────────────────────────
 FROM cgr.dev/chainguard/python:latest
 
