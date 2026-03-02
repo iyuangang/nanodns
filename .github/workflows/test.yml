@@ -87,11 +87,7 @@ jobs:
 
       - name: Run unit tests with coverage
         run: |
-          pytest tests/ -v \
-            --cov=nanodns \
-            --cov-report=term-missing \
-            --cov-report=xml:coverage-${{ matrix.os }}-${{ matrix.python-version }}.xml \
-            --cov-fail-under=85
+          pytest tests/ -v --cov=nanodns --cov-report=term-missing --cov-report=xml:coverage-${{ matrix.os }}-${{ matrix.python-version }}.xml --cov-fail-under=85
 
       - name: Upload coverage artifact
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
