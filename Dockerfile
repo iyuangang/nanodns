@@ -12,7 +12,9 @@ RUN pip install --upgrade pip build \
 RUN python -m pip install --no-cache-dir \
  --prefix=/install \
  /build/dist/*.whl
-
+ 
+# Default config generation
+RUN /install/nanodns init /etc/nanodns.json
 
 # ─── Stage 2: Chainguard Runtime ───────────────────────────────────
 FROM cgr.dev/chainguard/python:latest
@@ -33,8 +35,7 @@ LABEL org.opencontainers.image.title="NanoDNS" \
 # Copy installed packages
 COPY --from=builder /install /usr/local
 
-# Default config generation
-RUN nanodns init /etc/nanodns.json
+COPY --from=builder /etc/nanodns.json /etc/nanodns.json
 
 EXPOSE 53/udp
 
