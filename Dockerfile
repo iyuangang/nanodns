@@ -19,6 +19,7 @@ RUN nanodns init /etc/nanodns.json
 
 RUN python -m pip install --no-cache-dir \
  --prefix=/install \
+ --force-reinstall \
  /build/dist/*.whl
 
  RUN ls -lah /install/bin
