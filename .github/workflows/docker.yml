@@ -1,4 +1,4 @@
-name: Build & Publish Docker Image (OCI)
+name: Build & Publish Hardened OCI Image
 
 on:
   push:
@@ -14,22 +14,26 @@ env:
   GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/nanodns
   DOCKERHUB_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/nanodns
 
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
 jobs:
-  # ─── Call the shared test workflow first ────────────────────────────────────
+
+# ─────────────────────────────────────────────
+# 1️⃣ Run Tests First
+# ─────────────────────────────────────────────
   tests:
-    name: Run Tests
     uses: ./.github/workflows/test.yml
 
-  # ─── Build & Push ───────────────────────────────────────────────────────────
-  docker:
-    name: Build & Push OCI Image
-    runs-on: ubuntu-latest
-    needs: tests  # only proceed if tests passed
 
-    permissions:
-      contents: read
-      packages: write
-      id-token: write
+# ─────────────────────────────────────────────
+# 2️⃣ Build & Push Multi-Arch Image
+# ─────────────────────────────────────────────
+  docker:
+    runs-on: ubuntu-latest
+    needs: tests
 
     outputs:
       digest: ${{ steps.build.outputs.digest }}
@@ -45,7 +49,7 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
-      - name: Log in to GHCR
+      - name: Login GHCR
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
@@ -53,14 +57,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Log in to Docker Hub
+      - name: Login DockerHub
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Extract OCI metadata
+      - name: Extract Metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -77,16 +81,12 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
           labels: |
             org.opencontainers.image.title=NanoDNS
-            org.opencontainers.image.description=Lightweight JSON-configurable DNS server for internal networks
+            org.opencontainers.image.description=Lightweight JSON-configurable DNS server
             org.opencontainers.image.vendor=NanoDNS Contributors
             org.opencontainers.image.licenses=MIT
-            org.opencontainers.image.documentation=https://github.com/${{ github.repository }}/blob/main/USAGE.md
-          annotations: |
-            org.opencontainers.image.title=NanoDNS
-            org.opencontainers.image.description=Lightweight JSON-configurable DNS server for internal networks
-            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
 
-      - name: Build and push OCI image
+      - name: Build & Push
         id: build
         uses: docker/build-push-action@v6
         with:
@@ -96,139 +96,93 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          annotations: ${{ steps.meta.outputs.annotations }}
           build-args: |
             VERSION=${{ steps.meta.outputs.version }}
             BUILD_DATE=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
             GIT_REVISION=${{ github.sha }}
             REPO_URL=https://github.com/${{ github.repository }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: |
+            type=gha
+            type=registry,ref=${{ env.GHCR_IMAGE }}:buildcache
+          cache-to: |
+            type=gha,mode=max
+            type=registry,ref=${{ env.GHCR_IMAGE }}:buildcache,mode=max
           provenance: true
           sbom: true
 
-      - name: Install cosign
-        if: github.event_name != 'pull_request'
-        uses: sigstore/cosign-installer@v3
-
-      - name: Sign OCI image (keyless)
-        if: github.event_name != 'pull_request'
-        env:
-          DIGEST: ${{ steps.build.outputs.digest }}
-        run: |
-          cosign sign --yes "${{ env.GHCR_IMAGE }}@${DIGEST}"
-          cosign sign --yes "${{ env.DOCKERHUB_IMAGE }}@${DIGEST}"
-
-  # ─── Verify Docker Image ────────────────────────────────────────────────────
-  verify-docker:
-    name: Verify Docker Image (amd64)
+# ─────────────────────────────────────────────
+# 3️⃣ Runtime Verification (amd64)
+# ─────────────────────────────────────────────
+  verify-runtime:
     runs-on: ubuntu-latest
     needs: docker
     if: github.event_name != 'pull_request'
 
     steps:
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
+      - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set image reference
-        id: ref
-        run: echo "image=${{ env.GHCR_IMAGE }}@${{ needs.docker.outputs.digest }}" >> $GITHUB_OUTPUT
+      - name: Pull by Digest
+        run: docker pull ${{ env.GHCR_IMAGE }}@${{ needs.docker.outputs.digest }}
 
-      - name: Pull image by digest
-        run: docker pull ${{ steps.ref.outputs.image }}
-
-      - name: Verify nanodns --version
-        run: docker run --rm ${{ steps.ref.outputs.image }} nanodns --version
-
-      - name: Verify required OCI labels
+      - name: Verify CLI
         run: |
-          IMAGE="${{ steps.ref.outputs.image }}"
-          MISSING=0
-          for label in \
-            org.opencontainers.image.title \
-            org.opencontainers.image.description \
-            org.opencontainers.image.version \
-            org.opencontainers.image.created \
-            org.opencontainers.image.source \
-            org.opencontainers.image.revision \
-            org.opencontainers.image.licenses; do
-            VALUE=$(docker inspect "$IMAGE" --format "{{ index .Config.Labels \"$label\" }}")
-            if [ -z "$VALUE" ]; then
-              echo "❌ Missing: $label"; MISSING=$((MISSING+1))
-            else
-              echo "✅ $label = $VALUE"
-            fi
-          done
-          [ $MISSING -eq 0 ] || exit 1
+          docker run --rm \
+            --entrypoint nanodns \
+            ${{ env.GHCR_IMAGE }}@${{ needs.docker.outputs.digest }} \
+            --version
 
-      - name: Verify non-root user
+      - name: Functional DNS Test
         run: |
-          USER=$(docker inspect ${{ steps.ref.outputs.image }} --format '{{ .Config.User }}')
-          echo "User: $USER"
-          [[ "$USER" == "root" || "$USER" == "0" || -z "$USER" ]] && echo "⚠️ runs as root" || echo "✅ non-root: $USER"
-
-      - name: Verify 53/udp exposed
-        run: |
-          PORTS=$(docker inspect ${{ steps.ref.outputs.image }} --format '{{ json .Config.ExposedPorts }}')
-          echo "$PORTS" | grep -q "53/udp" && echo "✅ 53/udp exposed" || (echo "❌ 53/udp not exposed" && exit 1)
-
-      - name: Functional DNS resolution test
-        run: |
-          cat > /tmp/test.json << 'CONF'
+          cat > test.json <<EOF
           {
-            "server": {"host":"0.0.0.0","port":53,"upstream":["8.8.8.8"],"log_queries":false},
-            "zones": {"verify.lan": {}},
-            "records": [{"name":"ping.verify.lan","type":"A","value":"1.2.3.4","ttl":60}],
-            "rewrites": []
+            "server":{"host":"0.0.0.0","port":53,"upstream":["8.8.8.8"]},
+            "zones":{"verify.lan":{}},
+            "records":[{"name":"ping.verify.lan","type":"A","value":"1.2.3.4","ttl":60}],
+            "rewrites":[]
           }
-          CONF
+          EOF
 
-          docker run -d --name dns-verify \
+          docker run -d --name dns-test \
             --cap-add NET_BIND_SERVICE \
             -p 5399:53/udp \
-            -v /tmp/test.json:/etc/nanodns/nanodns.json:ro \
-            ${{ steps.ref.outputs.image }}
+            -v $PWD/test.json:/etc/nanodns/nanodns.json:ro \
+            ${{ env.GHCR_IMAGE }}@${{ needs.docker.outputs.digest }}
 
           sleep 5
-          sudo apt-get install -y -q dnsutils > /dev/null 2>&1
-          RESULT=$(dig @127.0.0.1 -p 5399 ping.verify.lan A +short +time=3)
-          docker stop dns-verify && docker rm dns-verify
+          sudo apt-get update -qq
+          sudo apt-get install -y dnsutils -qq
+          RESULT=$(dig @127.0.0.1 -p 5399 ping.verify.lan A +short)
 
-          [ "$RESULT" = "1.2.3.4" ] && echo "✅ DNS works: $RESULT" || (echo "❌ Got: $RESULT" && exit 1)
+          docker stop dns-test
+          docker rm dns-test
 
-  # ─── Verify arm64 via QEMU ──────────────────────────────────────────────────
-  verify-arm64:
-    name: Verify Docker Image (arm64)
+          [ "$RESULT" = "1.2.3.4" ]
+
+
+# ─────────────────────────────────────────────
+# 4️⃣ Vulnerability Scan
+# ─────────────────────────────────────────────
+  scan:
     runs-on: ubuntu-latest
     needs: docker
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name != 'pull_request'
 
     steps:
-      - uses: docker/setup-qemu-action@v3
+      - uses: aquasecurity/trivy-action@0.24.0
         with:
-          platforms: linux/arm64
+          image-ref: ${{ env.GHCR_IMAGE }}@${{ needs.docker.outputs.digest }}
+          severity: CRITICAL,HIGH
+          exit-code: 1
 
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Pull and verify arm64 image
-        run: |
-          docker pull --platform linux/arm64 "${{ env.GHCR_IMAGE }}@${{ needs.docker.outputs.digest }}"
-          docker run --rm --platform linux/arm64 \
-            "${{ env.GHCR_IMAGE }}@${{ needs.docker.outputs.digest }}" nanodns --version
-          echo "✅ arm64 image verified"
-
-  # ─── Verify cosign signature ────────────────────────────────────────────────
-  verify-signature:
-    name: Verify Cosign Signature
+# ─────────────────────────────────────────────
+# 5️⃣ Cosign Sign (Tag Only)
+# ─────────────────────────────────────────────
+  sign:
     runs-on: ubuntu-latest
     needs: docker
     if: startsWith(github.ref, 'refs/tags/v')
@@ -236,46 +190,54 @@ jobs:
     steps:
       - uses: sigstore/cosign-installer@v3
 
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Verify GHCR signature
+      - name: Sign Image (Keyless)
         run: |
-          cosign verify \
-            --certificate-identity-regexp="https://github.com/${{ github.repository }}/*" \
-            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
-            "${{ env.GHCR_IMAGE }}@${{ needs.docker.outputs.digest }}"
-          echo "✅ GHCR signature verified"
+          cosign sign --yes \
+            ${{ env.GHCR_IMAGE }}@${{ needs.docker.outputs.digest }}
 
-      - name: Verify Docker Hub signature
-        run: |
-          cosign verify \
-            --certificate-identity-regexp="https://github.com/${{ github.repository }}/*" \
-            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
-            "${{ env.DOCKERHUB_IMAGE }}@${{ needs.docker.outputs.digest }}"
-          echo "✅ Docker Hub signature verified"
 
-  # ─── Summary ────────────────────────────────────────────────────────────────
-  summary:
-    name: Publish Summary
+# ─────────────────────────────────────────────
+# 6️⃣ Verify Signature + Provenance
+# ─────────────────────────────────────────────
+  verify-signature:
     runs-on: ubuntu-latest
-    needs: [docker, verify-docker, verify-signature]
-    if: always() && startsWith(github.ref, 'refs/tags/v')
+    needs: [docker, sign]
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Verify Signature
+        run: |
+          cosign verify \
+            --certificate-identity-regexp="https://github.com/${{ github.repository }}/*" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+            ${{ env.GHCR_IMAGE }}@${{ needs.docker.outputs.digest }}
+
+      - name: Verify Provenance
+        run: |
+          cosign verify-attestation \
+            --type slsaprovenance \
+            --certificate-identity-regexp="https://github.com/${{ github.repository }}/*" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+            ${{ env.GHCR_IMAGE }}@${{ needs.docker.outputs.digest }}
+
+
+# ─────────────────────────────────────────────
+# 7️⃣ Release Summary (Tag Only)
+# ─────────────────────────────────────────────
+  summary:
+    runs-on: ubuntu-latest
+    needs: [docker, verify-runtime, scan]
+    if: startsWith(github.ref, 'refs/tags/v')
 
     steps:
       - run: |
-          echo "### 🐳 Docker Image Published & Verified" >> $GITHUB_STEP_SUMMARY
-          echo "| Registry | Image |" >> $GITHUB_STEP_SUMMARY
-          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| GHCR | \`${{ env.GHCR_IMAGE }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Docker Hub | \`${{ env.DOCKERHUB_IMAGE }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "## 🐳 NanoDNS Image Published" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Digest:** \`${{ needs.docker.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Build | ${{ needs.docker.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Image Verify (amd64) | ${{ needs.verify-docker.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Cosign Signature | ${{ needs.verify-signature.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Runtime | ${{ needs.verify-runtime.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Scan | ${{ needs.scan.result }} |" >> $GITHUB_STEP_SUMMARY

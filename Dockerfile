@@ -56,4 +56,5 @@ VOLUME ["/etc/nanodns"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD python -c "import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(3); s.sendto(b'\x00\x01\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x06google\x03com\x00\x00\x01\x00\x01', ('127.0.0.1',53)); s.recv(512); s.close()" || exit 1
 
-ENTRYPOINT ["nanodns", "start", "--config", "/etc/nanodns/nanodns.json"]
+ENTRYPOINT ["nanodns"]
+CMD ["start", "--config", "/etc/nanodns/nanodns.json"]
