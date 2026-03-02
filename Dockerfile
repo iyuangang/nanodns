@@ -33,16 +33,12 @@ LABEL org.opencontainers.image.title="NanoDNS" \
 # Copy installed packages
 COPY --from=builder /install /usr/local
 
-# Create config directory
-WORKDIR /etc/nanodns
-RUN mkdir -p /etc/nanodns
-
 # Default config generation
-RUN nanodns init /etc/nanodns/nanodns.json
+RUN nanodns init /etc/nanodns.json
 
 EXPOSE 53/udp
 
 USER root
 
 ENTRYPOINT ["nanodns"]
-CMD ["start","--config","/etc/nanodns/nanodns.json"]
+CMD ["start","--config","/etc/nanodns.json"]
