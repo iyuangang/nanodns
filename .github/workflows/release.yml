@@ -69,11 +69,11 @@ jobs:
       - name: Verify pyproject.toml version matches tag
         run: |
           PROJECT_VERSION=$(python - <<EOF
-import tomllib
-with open("pyproject.toml","rb") as f:
-    print(tomllib.load(f)["project"]["version"])
-EOF
-)
+          import tomllib
+          with open("pyproject.toml","rb") as f:
+            print(tomllib.load(f)["project"]["version"])
+          EOF
+          )
           TAG_VERSION="${{ steps.version.outputs.version }}"
           if [ "$PROJECT_VERSION" != "$TAG_VERSION" ]; then
             echo "❌ Version mismatch"
