@@ -1,0 +1,205 @@
+name: Build & Publish Docker Image (OCI)
+
+on:
+  push:
+    tags:
+      - "v*"           # Release: v1.2.3
+    branches:
+      - main           # Snapshot builds on main
+  pull_request:
+    branches:
+      - main           # Build only (no push) on PRs
+
+env:
+  # GitHub Container Registry
+  GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/nanodns
+  # Docker Hub
+  DOCKERHUB_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/nanodns
+
+jobs:
+  # ─── Job 1: Build & Push ──────────────────────────────────────────────────
+  docker:
+    name: Build & Push OCI Image
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write   # push to ghcr.io
+      id-token: write   # cosign OIDC signing
+
+    steps:
+      # 1. Checkout
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Set up QEMU for multi-platform builds (arm64, amd64)
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
+
+      # 3. Set up Docker Buildx (OCI builder)
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:latest
+            network=host
+
+      # 4. Log in to GitHub Container Registry
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 5. Log in to Docker Hub
+      - name: Log in to Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # 6. Extract OCI-compliant metadata & tags
+      #    Follows OCI Image Spec: https://specs.opencontainers.org/image-spec/annotations/
+      - name: Extract Docker metadata (OCI)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.GHCR_IMAGE }}
+            ${{ env.DOCKERHUB_IMAGE }}
+          # Tag strategy:
+          #   v1.2.3 tag  → :1.2.3  :1.2  :1  :latest
+          #   main branch → :main   :sha-<short>
+          #   PR          → :pr-42
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+          # OCI annotations (image-spec §8)
+          labels: |
+            org.opencontainers.image.title=nanodns
+            org.opencontainers.image.description=Lightweight JSON-configurable DNS server for internal networks
+            org.opencontainers.image.vendor=nanodns Contributors
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.documentation=https://github.com/${{ github.repository }}/blob/main/USAGE.md
+          # OCI annotations on the index manifest (multi-platform)
+          annotations: |
+            org.opencontainers.image.title=nanodns
+            org.opencontainers.image.description=Lightweight JSON-configurable DNS server for internal networks
+            org.opencontainers.image.licenses=MIT
+
+      # 7. Build and push multi-platform OCI image
+      - name: Build and push OCI image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          # Multi-platform: amd64 + arm64 (Raspberry Pi / Apple Silicon compatible)
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          # Build args for OCI labels inside Dockerfile
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            BUILD_DATE=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
+            GIT_REVISION=${{ github.sha }}
+            REPO_URL=https://github.com/${{ github.repository }}
+          # Cache layers via GitHub Actions cache (OCI cache export)
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Output OCI image format (not Docker legacy format)
+          provenance: true    # SLSA provenance attestation
+          sbom: true          # Software Bill of Materials
+
+      # 8. Install cosign for image signing
+      - name: Install cosign
+        if: github.event_name != 'pull_request'
+        uses: sigstore/cosign-installer@v3
+
+      # 9. Sign the OCI image with cosign (keyless, OIDC)
+      #    Produces a transparency log entry on Rekor
+      - name: Sign OCI image with cosign (keyless)
+        if: github.event_name != 'pull_request'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          echo "Signing images with digest: $DIGEST"
+          # Sign both registries
+          cosign sign --yes \
+            "${{ env.GHCR_IMAGE }}@${DIGEST}"
+          cosign sign --yes \
+            "${{ env.DOCKERHUB_IMAGE }}@${DIGEST}"
+
+      # 10. Print image digest summary
+      - name: Image digest summary
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "### 🐳 Docker Image Published" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Registry | Image |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| GHCR     | \`${{ env.GHCR_IMAGE }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Docker Hub | \`${{ env.DOCKERHUB_IMAGE }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Digest:** \`${{ steps.build.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Tags:**" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+  # ─── Job 2: Verify OCI annotations ──────────────────────────────────────────
+  verify:
+    name: Verify OCI Image
+    runs-on: ubuntu-latest
+    needs: docker
+    if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: Install crane (OCI inspection tool)
+        uses: imjasonh/setup-crane@v0.4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Inspect OCI manifest & annotations
+        run: |
+          IMAGE="${{ env.GHCR_IMAGE }}:${{ github.ref_name }}"
+          echo "## OCI Manifest" 
+          crane manifest "$IMAGE" | python3 -m json.tool
+
+          echo ""
+          echo "## OCI Annotations"
+          crane config "$IMAGE" | python3 -c "
+          import json, sys
+          cfg = json.load(sys.stdin)
+          labels = cfg.get('config', {}).get('Labels', {})
+          for k, v in sorted(labels.items()):
+              if 'opencontainers' in k:
+                  print(f'  {k} = {v}')
+          "
+
+      - name: Verify cosign signature
+        run: |
+          cosign verify \
+            --certificate-identity-regexp="https://github.com/${{ github.repository }}/*" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+            "${{ env.GHCR_IMAGE }}:${{ github.ref_name }}"
+          echo "✅ Signature verified"
