@@ -1,5 +1,5 @@
 """
-Integration tests for NanoDNS.
+Integration tests for TinyDNS.
 Starts a real UDP server on a random port and sends actual DNS queries over the network.
 """
 
@@ -10,6 +10,13 @@ import time
 import os
 import sys
 import pytest
+
+# Windows Python 3.12+ defaults to ProactorEventLoop which raises
+# "handle is invalid" / "event loop is closed" warnings during test teardown
+# when UDP transports are not cleanly shut down.  Force SelectorEventLoop on
+# Windows to avoid these spurious warnings without affecting functionality.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -133,10 +140,18 @@ class LiveServer:
         except asyncio.CancelledError:
             pass
         finally:
-            transport.close()
+            try:
+                transport.close()
+            except Exception:
+                pass
 
     def stop(self):
         if self._loop and not self._loop.is_closed():
+            # Close transport first while the loop is still alive to avoid
+            # the Windows Proactor "handle is invalid" / "event loop closed"
+            # errors that occur when transport cleanup races with loop teardown.
+            if self._transport is not None:
+                self._loop.call_soon_threadsafe(self._transport.close)
             self._loop.call_soon_threadsafe(self._loop.stop)
 
 
