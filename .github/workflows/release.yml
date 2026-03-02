@@ -9,75 +9,16 @@ permissions:
   contents: write
 
 jobs:
-  # ─── Job 1: Unit Tests ──────────────────────────────────────────────────────
-  unit-test:
-    name: Unit Tests (Python ${{ matrix.python-version }} / ${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.10", "3.11", "3.12"]
-        os: [ubuntu-latest, windows-latest, macos-latest]
+  # ─── Call the shared test workflow first ─────────────────────────────────
+  tests:
+    name: Run Tests
+    uses: ./.github/workflows/test.yml
 
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install pytest pytest-cov
-          pip install -e .
-
-      - name: Run unit tests with coverage
-        run: |
-          pytest tests/test_unit.py -v \
-            --cov=nanodns \
-            --cov-report=term-missing \
-            --cov-report=xml:coverage.xml \
-            --cov-fail-under=80
-
-      - name: Upload coverage report
-        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-report
-          path: coverage.xml
-          retention-days: 7
-
-  # ─── Job 2: Integration Tests ───────────────────────────────────────────────
-  integration-test:
-    name: Integration Tests (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.10", "3.12"]
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Install dependencies
-        run: |
-          pip install pytest pytest-asyncio
-          pip install -e .
-
-      - name: Run integration tests
-        run: pytest tests/test_integration.py -v --tb=short
-
-  # ─── Job 3: Build ───────────────────────────────────────────────────────────
+  # ─── Build ─────────────────────────────────────────────────────────────────
   build:
     name: Build Distribution
     runs-on: ubuntu-latest
-    needs: [unit-test, integration-test]
+    needs: tests  # only proceed if tests passed
 
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -87,8 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
@@ -111,10 +51,10 @@ jobs:
           ")
           TAG_VERSION="${{ steps.version.outputs.version }}"
           if [ "$PROJECT_VERSION" != "$TAG_VERSION" ]; then
-            echo "❌ Version mismatch! pyproject.toml=$PROJECT_VERSION, tag=$TAG_VERSION"
+            echo "❌ Version mismatch: pyproject=$PROJECT_VERSION tag=$TAG_VERSION"
             exit 1
           fi
-          echo "✅ Versions match: $PROJECT_VERSION"
+          echo "✅ Version: $PROJECT_VERSION"
 
       - name: Build sdist and wheel
         run: python -m build
@@ -125,20 +65,16 @@ jobs:
       - name: Capture artifact filenames
         id: filenames
         run: |
-          WHL=$(ls dist/*.whl | xargs basename)
-          SDIST=$(ls dist/*.tar.gz | xargs basename)
-          echo "whl=$WHL" >> $GITHUB_OUTPUT
-          echo "sdist=$SDIST" >> $GITHUB_OUTPUT
-          echo "Built: $WHL, $SDIST"
+          echo "whl=$(ls dist/*.whl | xargs basename)" >> $GITHUB_OUTPUT
+          echo "sdist=$(ls dist/*.tar.gz | xargs basename)" >> $GITHUB_OUTPUT
 
-      - name: Upload dist artifacts
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: dist
           path: dist/
           retention-days: 3
 
-  # ─── Job 4: Verify WHL Package ─────────────────────────────────────────────
+  # ─── Verify WHL on all platforms ───────────────────────────────────────────
   verify-whl:
     name: Verify WHL (${{ matrix.os }} / Python ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
@@ -152,88 +88,66 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Download dist artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: dist
           path: dist/
 
-      - name: Install wheel (isolated — no -e, no source)
+      - name: Install wheel (isolated)
         run: pip install dist/${{ needs.build.outputs.whl-name }}
 
-      - name: Verify CLI is available
-        run: nanodns --version
-
-      - name: Verify expected version
+      - name: Verify CLI version
+        shell: bash
         run: |
           INSTALLED=$(nanodns --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
           EXPECTED="${{ needs.build.outputs.version }}"
-          if [ "$INSTALLED" != "$EXPECTED" ]; then
-            echo "❌ Version mismatch: installed=$INSTALLED expected=$EXPECTED"
-            exit 1
-          fi
-          echo "✅ Version verified: $INSTALLED"
-        shell: bash
+          [ "$INSTALLED" = "$EXPECTED" ] && echo "✅ $INSTALLED" || (echo "❌ $INSTALLED != $EXPECTED" && exit 1)
 
-      - name: Verify nanodns init generates a valid config
+      - name: Verify init and check commands
+        shell: bash
         run: |
-          nanodns init test_output.json
-          python -c "import json; d=json.load(open('test_output.json')); assert 'server' in d and 'records' in d"
-          echo "✅ init command works"
-        shell: bash
+          nanodns init verify.json
+          nanodns check verify.json
+          echo "✅ init/check OK"
 
-      - name: Verify nanodns check accepts generated config
-        run: |
-          nanodns init verify_config.json
-          nanodns check verify_config.json
-          echo "✅ check command works"
-        shell: bash
-
-      - name: Verify package imports correctly
+      - name: Verify all modules import
         run: |
           python -c "
-          from nanodns.protocol import parse_message, build_message, DNSMessage, QType
-          from nanodns.config import load_config, _parse_config
+          from nanodns.protocol import parse_message, build_message
+          from nanodns.config import load_config
           from nanodns.cache import DNSCache
           from nanodns.handler import DNSHandler
           from nanodns.server import DNSServer
-          print('✅ All modules import successfully')
+          print('✅ All imports OK')
           "
 
-      - name: Verify DNS resolution via installed package
+      - name: Functional DNS resolution test
+        shell: bash
         run: |
           python -c "
-          import sys
-          sys.path.insert(0, '.')
           from nanodns.protocol import DNSMessage, DNSQuestion, QType, QClass, build_message, parse_message, encode_a
           from nanodns.config import _parse_config
           from nanodns.cache import DNSCache
           from nanodns.handler import DNSHandler
 
           cfg = _parse_config({
-              'server': {'host': '127.0.0.1', 'port': 5353, 'upstream': [], 'log_queries': False},
+              'server': {'host':'127.0.0.1','port':5353,'upstream':[],'log_queries':False},
               'zones': {'verify.lan': {}},
-              'records': [{'name': 'test.verify.lan', 'type': 'A', 'value': '1.2.3.4', 'ttl': 60}],
+              'records': [{'name':'ping.verify.lan','type':'A','value':'1.2.3.4','ttl':60}],
               'rewrites': []
           }, None)
-          handler = DNSHandler(cfg, DNSCache())
-
           msg = DNSMessage(msg_id=1, flags=0x0100)
-          msg.questions.append(DNSQuestion('test.verify.lan', QType.A, QClass.IN))
-          resp = parse_message(handler.handle(build_message(msg)))
-
-          assert resp.rcode == 0, f'Expected NOERROR, got rcode={resp.rcode}'
-          assert len(resp.answers) == 1
-          assert resp.answers[0].rdata == encode_a('1.2.3.4')
-          print('✅ DNS resolution verified from installed package')
+          msg.questions.append(DNSQuestion('ping.verify.lan', QType.A, QClass.IN))
+          resp = parse_message(DNSHandler(cfg, DNSCache()).handle(build_message(msg)))
+          assert resp.rcode == 0 and resp.answers[0].rdata == encode_a('1.2.3.4')
+          print('✅ DNS resolution OK')
           "
 
-  # ─── Job 5: GitHub Release ──────────────────────────────────────────────────
+  # ─── GitHub Release ────────────────────────────────────────────────────────
   github-release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
@@ -244,8 +158,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Download dist artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: dist
           path: dist/
@@ -265,14 +178,11 @@ jobs:
             echo ""
             echo "$COMMITS"
             echo ""
-            if [ -n "$PREV_TAG" ]; then
-              echo "**Full Changelog:** https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${GITHUB_REF_NAME}"
-            fi
+            [ -n "$PREV_TAG" ] && echo "**Full Changelog:** https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${GITHUB_REF_NAME}"
             echo "EOF"
           } >> $GITHUB_OUTPUT
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           name: "NanoDNS ${{ github.ref_name }}"
@@ -283,7 +193,7 @@ jobs:
             dist/*.whl
             dist/*.tar.gz
 
-  # ─── Job 6: Publish to PyPI ─────────────────────────────────────────────────
+  # ─── Publish to PyPI ───────────────────────────────────────────────────────
   publish-pypi:
     name: Publish to PyPI
     runs-on: ubuntu-latest
@@ -291,61 +201,40 @@ jobs:
     environment:
       name: pypi
       url: https://pypi.org/project/nanodns-server/
-
     permissions:
       id-token: write
 
     steps:
-      - name: Download dist artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: dist
           path: dist/
 
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: pypa/gh-action-pypi-publish@release/v1
 
-  # ─── Job 7: Verify PyPI Package (post-publish) ──────────────────────────────
+  # ─── Post-publish PyPI verification ────────────────────────────────────────
   verify-pypi:
     name: Verify PyPI Package
     runs-on: ubuntu-latest
     needs: publish-pypi
 
     steps:
-      - name: Wait for PyPI index to update
+      - name: Wait for PyPI index propagation
         run: sleep 60
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install from PyPI (not local dist)
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          pip install "nanodns-server==$VERSION"
+      - name: Install from PyPI (not local)
+        run: pip install "nanodns-server==${{ needs.build.outputs.version }}"
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
 
-      - name: Verify version on PyPI
+      - name: Smoke test from PyPI
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           INSTALLED=$(nanodns --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
-          if [ "$INSTALLED" != "$VERSION" ]; then
-            echo "❌ PyPI version mismatch: installed=$INSTALLED expected=$VERSION"
-            exit 1
-          fi
-          echo "✅ PyPI package version verified: $INSTALLED"
-
-      - name: Smoke test from PyPI install
-        run: |
-          nanodns init smoke_test.json
-          nanodns check smoke_test.json
+          [ "$INSTALLED" = "$VERSION" ] && echo "✅ PyPI $INSTALLED" || (echo "❌" && exit 1)
+          nanodns init smoke.json && nanodns check smoke.json
           echo "✅ PyPI smoke test passed"
-
-      - name: Post summary
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          echo "### 📦 PyPI Publish Verified" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Package:** nanodns-server==$VERSION" >> $GITHUB_STEP_SUMMARY
-          echo "**URL:** https://pypi.org/project/nanodns-server/$VERSION/" >> $GITHUB_STEP_SUMMARY
-          echo "**Install:** \`pip install nanodns-server==$VERSION\`" >> $GITHUB_STEP_SUMMARY

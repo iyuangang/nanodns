@@ -15,10 +15,16 @@ env:
   DOCKERHUB_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/nanodns
 
 jobs:
-  # ─── Job 1: Build & Push ──────────────────────────────────────────────────
+  # ─── Call the shared test workflow first ────────────────────────────────────
+  tests:
+    name: Run Tests
+    uses: ./.github/workflows/test.yml
+
+  # ─── Build & Push ───────────────────────────────────────────────────────────
   docker:
     name: Build & Push OCI Image
     runs-on: ubuntu-latest
+    needs: tests  # only proceed if tests passed
 
     permissions:
       contents: read
@@ -31,18 +37,15 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-qemu-action@v3
         with:
           platforms: linux/amd64,linux/arm64
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v3
 
-      - name: Log in to GitHub Container Registry
+      - name: Log in to GHCR
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
@@ -57,7 +60,7 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Extract OCI metadata & tags
+      - name: Extract OCI metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -108,7 +111,7 @@ jobs:
         if: github.event_name != 'pull_request'
         uses: sigstore/cosign-installer@v3
 
-      - name: Sign OCI image with cosign (keyless)
+      - name: Sign OCI image (keyless)
         if: github.event_name != 'pull_request'
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
@@ -116,17 +119,12 @@ jobs:
           cosign sign --yes "${{ env.GHCR_IMAGE }}@${DIGEST}"
           cosign sign --yes "${{ env.DOCKERHUB_IMAGE }}@${DIGEST}"
 
-  # ─── Job 2: Verify Docker Image ───────────────────────────────────────────
+  # ─── Verify Docker Image ────────────────────────────────────────────────────
   verify-docker:
-    name: Verify Docker Image (${{ matrix.platform }})
+    name: Verify Docker Image (amd64)
     runs-on: ubuntu-latest
     needs: docker
     if: github.event_name != 'pull_request'
-    strategy:
-      fail-fast: false
-      matrix:
-        platform: [linux/amd64]   # arm64 needs emulation — tested separately below
-        registry: [ghcr]
 
     steps:
       - name: Log in to GHCR
@@ -138,135 +136,79 @@ jobs:
 
       - name: Set image reference
         id: ref
-        run: |
-          DIGEST="${{ needs.docker.outputs.digest }}"
-          echo "image=${{ env.GHCR_IMAGE }}@${DIGEST}" >> $GITHUB_OUTPUT
+        run: echo "image=${{ env.GHCR_IMAGE }}@${{ needs.docker.outputs.digest }}" >> $GITHUB_OUTPUT
 
       - name: Pull image by digest
-        run: docker pull --platform ${{ matrix.platform }} ${{ steps.ref.outputs.image }}
+        run: docker pull ${{ steps.ref.outputs.image }}
 
-      - name: Verify image starts successfully
-        run: |
-          docker run --rm --platform ${{ matrix.platform }} \
-            ${{ steps.ref.outputs.image }} \
-            nanodns --version
+      - name: Verify nanodns --version
+        run: docker run --rm ${{ steps.ref.outputs.image }} nanodns --version
 
-      - name: Verify expected version label
+      - name: Verify required OCI labels
         run: |
           IMAGE="${{ steps.ref.outputs.image }}"
-          LABEL_VERSION=$(docker inspect "$IMAGE" \
-            --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')
-          echo "OCI version label: $LABEL_VERSION"
-
-      - name: Verify all required OCI annotations
-        run: |
-          IMAGE="${{ steps.ref.outputs.image }}"
-          REQUIRED_LABELS=(
-            "org.opencontainers.image.title"
-            "org.opencontainers.image.description"
-            "org.opencontainers.image.version"
-            "org.opencontainers.image.created"
-            "org.opencontainers.image.source"
-            "org.opencontainers.image.revision"
-            "org.opencontainers.image.licenses"
-          )
           MISSING=0
-          for label in "${REQUIRED_LABELS[@]}"; do
+          for label in \
+            org.opencontainers.image.title \
+            org.opencontainers.image.description \
+            org.opencontainers.image.version \
+            org.opencontainers.image.created \
+            org.opencontainers.image.source \
+            org.opencontainers.image.revision \
+            org.opencontainers.image.licenses; do
             VALUE=$(docker inspect "$IMAGE" --format "{{ index .Config.Labels \"$label\" }}")
             if [ -z "$VALUE" ]; then
-              echo "❌ Missing OCI label: $label"
-              MISSING=$((MISSING+1))
+              echo "❌ Missing: $label"; MISSING=$((MISSING+1))
             else
               echo "✅ $label = $VALUE"
             fi
           done
-          if [ $MISSING -gt 0 ]; then
-            echo "❌ $MISSING required OCI labels are missing"
-            exit 1
-          fi
+          [ $MISSING -eq 0 ] || exit 1
 
       - name: Verify non-root user
         run: |
-          IMAGE="${{ steps.ref.outputs.image }}"
-          USER=$(docker inspect "$IMAGE" --format '{{ .Config.User }}')
-          echo "Container user: $USER"
-          if [ "$USER" = "root" ] || [ "$USER" = "0" ] || [ -z "$USER" ]; then
-            echo "⚠️ Warning: container runs as root"
-          else
-            echo "✅ Container runs as non-root: $USER"
-          fi
+          USER=$(docker inspect ${{ steps.ref.outputs.image }} --format '{{ .Config.User }}')
+          echo "User: $USER"
+          [[ "$USER" == "root" || "$USER" == "0" || -z "$USER" ]] && echo "⚠️ runs as root" || echo "✅ non-root: $USER"
 
-      - name: Verify exposed DNS port
+      - name: Verify 53/udp exposed
         run: |
-          IMAGE="${{ steps.ref.outputs.image }}"
-          PORTS=$(docker inspect "$IMAGE" --format '{{ json .Config.ExposedPorts }}')
-          echo "Exposed ports: $PORTS"
-          if echo "$PORTS" | grep -q "53/udp"; then
-            echo "✅ Port 53/udp is exposed"
-          else
-            echo "❌ Port 53/udp not found in exposed ports"
-            exit 1
-          fi
+          PORTS=$(docker inspect ${{ steps.ref.outputs.image }} --format '{{ json .Config.ExposedPorts }}')
+          echo "$PORTS" | grep -q "53/udp" && echo "✅ 53/udp exposed" || (echo "❌ 53/udp not exposed" && exit 1)
 
-      - name: Functional DNS test — container resolves queries
+      - name: Functional DNS resolution test
         run: |
-          # Write a minimal test config
           cat > /tmp/test.json << 'CONF'
           {
-            "server": {"host": "0.0.0.0", "port": 53, "upstream": ["8.8.8.8"], "log_queries": false},
+            "server": {"host":"0.0.0.0","port":53,"upstream":["8.8.8.8"],"log_queries":false},
             "zones": {"verify.lan": {}},
-            "records": [{"name": "ping.verify.lan", "type": "A", "value": "1.2.3.4", "ttl": 60}],
+            "records": [{"name":"ping.verify.lan","type":"A","value":"1.2.3.4","ttl":60}],
             "rewrites": []
           }
           CONF
 
-          # Run DNS server in background
           docker run -d --name dns-verify \
-            --platform ${{ matrix.platform }} \
             --cap-add NET_BIND_SERVICE \
             -p 5399:53/udp \
             -v /tmp/test.json:/etc/nanodns/nanodns.json:ro \
             ${{ steps.ref.outputs.image }}
 
-          # Wait for it to come up
           sleep 5
-
-          # Query it
           sudo apt-get install -y -q dnsutils > /dev/null 2>&1
           RESULT=$(dig @127.0.0.1 -p 5399 ping.verify.lan A +short +time=3)
-          echo "DNS query result: $RESULT"
+          docker stop dns-verify && docker rm dns-verify
 
-          docker stop dns-verify
-          docker rm dns-verify
+          [ "$RESULT" = "1.2.3.4" ] && echo "✅ DNS works: $RESULT" || (echo "❌ Got: $RESULT" && exit 1)
 
-          if [ "$RESULT" = "1.2.3.4" ]; then
-            echo "✅ Container DNS resolution works: $RESULT"
-          else
-            echo "❌ Expected 1.2.3.4 but got: $RESULT"
-            exit 1
-          fi
-
-      - name: Verify container health check definition
-        run: |
-          IMAGE="${{ steps.ref.outputs.image }}"
-          HEALTHCHECK=$(docker inspect "$IMAGE" --format '{{ json .Config.Healthcheck }}')
-          echo "Healthcheck: $HEALTHCHECK"
-          if [ "$HEALTHCHECK" = "null" ] || [ -z "$HEALTHCHECK" ]; then
-            echo "⚠️ No HEALTHCHECK defined"
-          else
-            echo "✅ HEALTHCHECK is defined"
-          fi
-
-  # ─── Job 3: Verify arm64 via QEMU ────────────────────────────────────────
-  verify-docker-arm64:
-    name: Verify Docker Image (linux/arm64 via QEMU)
+  # ─── Verify arm64 via QEMU ──────────────────────────────────────────────────
+  verify-arm64:
+    name: Verify Docker Image (arm64)
     runs-on: ubuntu-latest
     needs: docker
     if: startsWith(github.ref, 'refs/tags/v')
 
     steps:
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-qemu-action@v3
         with:
           platforms: linux/arm64
 
@@ -279,13 +221,12 @@ jobs:
 
       - name: Pull and verify arm64 image
         run: |
-          DIGEST="${{ needs.docker.outputs.digest }}"
-          IMAGE="${{ env.GHCR_IMAGE }}@${DIGEST}"
-          docker pull --platform linux/arm64 "$IMAGE"
-          docker run --rm --platform linux/arm64 "$IMAGE" nanodns --version
+          docker pull --platform linux/arm64 "${{ env.GHCR_IMAGE }}@${{ needs.docker.outputs.digest }}"
+          docker run --rm --platform linux/arm64 \
+            "${{ env.GHCR_IMAGE }}@${{ needs.docker.outputs.digest }}" nanodns --version
           echo "✅ arm64 image verified"
 
-  # ─── Job 4: Verify cosign signature ──────────────────────────────────────
+  # ─── Verify cosign signature ────────────────────────────────────────────────
   verify-signature:
     name: Verify Cosign Signature
     runs-on: ubuntu-latest
@@ -293,8 +234,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
 
     steps:
-      - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+      - uses: sigstore/cosign-installer@v3
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -303,25 +243,23 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Verify GHCR image signature
+      - name: Verify GHCR signature
         run: |
-          DIGEST="${{ needs.docker.outputs.digest }}"
           cosign verify \
             --certificate-identity-regexp="https://github.com/${{ github.repository }}/*" \
             --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
-            "${{ env.GHCR_IMAGE }}@${DIGEST}"
-          echo "✅ GHCR image signature verified"
+            "${{ env.GHCR_IMAGE }}@${{ needs.docker.outputs.digest }}"
+          echo "✅ GHCR signature verified"
 
-      - name: Verify Docker Hub image signature
+      - name: Verify Docker Hub signature
         run: |
-          DIGEST="${{ needs.docker.outputs.digest }}"
           cosign verify \
             --certificate-identity-regexp="https://github.com/${{ github.repository }}/*" \
             --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
-            "${{ env.DOCKERHUB_IMAGE }}@${DIGEST}"
-          echo "✅ Docker Hub image signature verified"
+            "${{ env.DOCKERHUB_IMAGE }}@${{ needs.docker.outputs.digest }}"
+          echo "✅ Docker Hub signature verified"
 
-  # ─── Job 5: Summary ────────────────────────────────────────────────────────
+  # ─── Summary ────────────────────────────────────────────────────────────────
   summary:
     name: Publish Summary
     runs-on: ubuntu-latest
@@ -329,24 +267,15 @@ jobs:
     if: always() && startsWith(github.ref, 'refs/tags/v')
 
     steps:
-      - name: Write job summary
-        run: |
+      - run: |
           echo "### 🐳 Docker Image Published & Verified" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Registry | Image |" >> $GITHUB_STEP_SUMMARY
           echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| GHCR     | \`${{ env.GHCR_IMAGE }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| GHCR | \`${{ env.GHCR_IMAGE }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Docker Hub | \`${{ env.DOCKERHUB_IMAGE }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Digest:** \`${{ needs.docker.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Build & Push | ${{ needs.docker.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build | ${{ needs.docker.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Image Verify (amd64) | ${{ needs.verify-docker.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Cosign Signature | ${{ needs.verify-signature.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Pull:**" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
-          echo "docker pull ${{ env.DOCKERHUB_IMAGE }}:${{ needs.docker.outputs.version }}" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
