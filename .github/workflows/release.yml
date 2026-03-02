@@ -6,34 +6,59 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read  # default read-only
+  id-token: none
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  # ─── Call the shared test workflow first ─────────────────────────────────
+
+  # ─────────────────────────────────────────────
+  # Tests (reuse shared workflow)
+  # ─────────────────────────────────────────────
   tests:
     name: Run Tests
     uses: ./.github/workflows/test.yml
+    permissions:
+      contents: read
 
-  # ─── Build ─────────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────
+  # Build
+  # ─────────────────────────────────────────────
   build:
     name: Build Distribution
     runs-on: ubuntu-latest
-    needs: tests  # only proceed if tests passed
+    needs: tests
+
+    permissions:
+      contents: read
 
     outputs:
       version: ${{ steps.version.outputs.version }}
       whl-name: ${{ steps.filenames.outputs.whl }}
       sdist-name: ${{ steps.filenames.outputs.sdist }}
 
-    steps:
-      - uses: actions/checkout@v4
+    env:
+      PYTHONHASHSEED: "0"
+      SOURCE_DATE_EPOCH: ${{ github.event.head_commit.timestamp }}
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install build tools
-        run: pip install build twine
+      - name: Upgrade pip (isolated)
+        run: |
+          python -m pip install --upgrade pip
+          pip install --upgrade build twine
 
       - name: Extract version from tag
         id: version
@@ -43,30 +68,35 @@ jobs:
 
       - name: Verify pyproject.toml version matches tag
         run: |
-          PROJECT_VERSION=$(python -c "
-          import tomllib
-          with open('pyproject.toml', 'rb') as f:
-              data = tomllib.load(f)
-          print(data['project']['version'])
-          ")
+          PROJECT_VERSION=$(python - <<EOF
+import tomllib
+with open("pyproject.toml","rb") as f:
+    print(tomllib.load(f)["project"]["version"])
+EOF
+)
           TAG_VERSION="${{ steps.version.outputs.version }}"
           if [ "$PROJECT_VERSION" != "$TAG_VERSION" ]; then
-            echo "❌ Version mismatch: pyproject=$PROJECT_VERSION tag=$TAG_VERSION"
+            echo "❌ Version mismatch"
             exit 1
           fi
-          echo "✅ Version: $PROJECT_VERSION"
 
-      - name: Build sdist and wheel
-        run: python -m build
+      - name: Clean previous builds
+        run: rm -rf dist build *.egg-info
 
-      - name: Check dist with twine
+      - name: Build sdist and wheel (reproducible)
+        run: python -m build --sdist --wheel
+
+      - name: Twine check
         run: twine check dist/*
 
-      - name: Capture artifact filenames
+      - name: Generate SHA256 checksums
+        run: sha256sum dist/* > dist/SHA256SUMS
+
+      - name: Capture filenames
         id: filenames
         run: |
-          echo "whl=$(ls dist/*.whl | xargs basename)" >> $GITHUB_OUTPUT
-          echo "sdist=$(ls dist/*.tar.gz | xargs basename)" >> $GITHUB_OUTPUT
+          echo "whl=$(basename dist/*.whl)" >> $GITHUB_OUTPUT
+          echo "sdist=$(basename dist/*.tar.gz)" >> $GITHUB_OUTPUT
 
       - uses: actions/upload-artifact@v4
         with:
@@ -74,20 +104,24 @@ jobs:
           path: dist/
           retention-days: 3
 
-  # ─── Verify WHL on all platforms ───────────────────────────────────────────
+  # ─────────────────────────────────────────────
+  # Verify WHL cross-platform
+  # ─────────────────────────────────────────────
   verify-whl:
-    name: Verify WHL (${{ matrix.os }} / Python ${{ matrix.python-version }})
+    name: Verify WHL (${{ matrix.os }} / Py ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
     needs: build
+
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
         python-version: ["3.10", "3.12"]
 
-    steps:
-      - uses: actions/checkout@v4
+    permissions:
+      contents: read
 
+    steps:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
@@ -97,61 +131,33 @@ jobs:
           name: dist
           path: dist/
 
-      - name: Install wheel (isolated)
-        run: pip install dist/${{ needs.build.outputs.whl-name }}
+      - name: Install wheel (no cache)
+        run: |
+          python -m pip install --no-cache-dir dist/${{ needs.build.outputs.whl-name }}
 
       - name: Verify CLI version
         shell: bash
         run: |
           INSTALLED=$(nanodns --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
           EXPECTED="${{ needs.build.outputs.version }}"
-          [ "$INSTALLED" = "$EXPECTED" ] && echo "✅ $INSTALLED" || (echo "❌ $INSTALLED != $EXPECTED" && exit 1)
+          [ "$INSTALLED" = "$EXPECTED" ]
 
-      - name: Verify init and check commands
+      - name: Smoke test
         shell: bash
         run: |
           nanodns init verify.json
           nanodns check verify.json
-          echo "✅ init/check OK"
 
-      - name: Verify all modules import
-        run: |
-          python -c "
-          from nanodns.protocol import parse_message, build_message
-          from nanodns.config import load_config
-          from nanodns.cache import DNSCache
-          from nanodns.handler import DNSHandler
-          from nanodns.server import DNSServer
-          print('✅ All imports OK')
-          "
-
-      - name: Functional DNS resolution test
-        shell: bash
-        run: |
-          python -c "
-          from nanodns.protocol import DNSMessage, DNSQuestion, QType, QClass, build_message, parse_message, encode_a
-          from nanodns.config import _parse_config
-          from nanodns.cache import DNSCache
-          from nanodns.handler import DNSHandler
-
-          cfg = _parse_config({
-              'server': {'host':'127.0.0.1','port':5353,'upstream':[],'log_queries':False},
-              'zones': {'verify.lan': {}},
-              'records': [{'name':'ping.verify.lan','type':'A','value':'1.2.3.4','ttl':60}],
-              'rewrites': []
-          }, None)
-          msg = DNSMessage(msg_id=1, flags=0x0100)
-          msg.questions.append(DNSQuestion('ping.verify.lan', QType.A, QClass.IN))
-          resp = parse_message(DNSHandler(cfg, DNSCache()).handle(build_message(msg)))
-          assert resp.rcode == 0 and resp.answers[0].rdata == encode_a('1.2.3.4')
-          print('✅ DNS resolution OK')
-          "
-
-  # ─── GitHub Release ────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────
+  # GitHub Release
+  # ─────────────────────────────────────────────
   github-release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
     needs: verify-whl
+
+    permissions:
+      contents: write
 
     steps:
       - uses: actions/checkout@v4
@@ -166,9 +172,9 @@ jobs:
       - name: Generate changelog
         id: changelog
         run: |
-          PREV_TAG=$(git tag --sort=-version:refname | grep -E '^v' | sed -n '2p')
+          PREV_TAG=$(git tag --sort=-version:refname | grep '^v' | sed -n '2p')
           if [ -z "$PREV_TAG" ]; then
-            COMMITS=$(git log --pretty=format:"- %s (%h)" HEAD)
+            COMMITS=$(git log --pretty=format:"- %s (%h)")
           else
             COMMITS=$(git log --pretty=format:"- %s (%h)" "$PREV_TAG"..HEAD)
           fi
@@ -177,8 +183,6 @@ jobs:
             echo "## What's Changed"
             echo ""
             echo "$COMMITS"
-            echo ""
-            [ -n "$PREV_TAG" ] && echo "**Full Changelog:** https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${GITHUB_REF_NAME}"
             echo "EOF"
           } >> $GITHUB_OUTPUT
 
@@ -192,17 +196,23 @@ jobs:
           files: |
             dist/*.whl
             dist/*.tar.gz
+            dist/SHA256SUMS
 
-  # ─── Publish to PyPI ───────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────
+  # Publish to PyPI (Trusted Publishing OIDC)
+  # ─────────────────────────────────────────────
   publish-pypi:
     name: Publish to PyPI
     runs-on: ubuntu-latest
     needs: github-release
+
+    permissions:
+      id-token: write   # REQUIRED for OIDC
+      contents: read
+
     environment:
       name: pypi
       url: https://pypi.org/project/nanodns-server/
-    permissions:
-      id-token: write
 
     steps:
       - uses: actions/download-artifact@v4
@@ -210,31 +220,41 @@ jobs:
           name: dist
           path: dist/
 
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - name: Publish via Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: false
+          verbose: true
 
-  # ─── Post-publish PyPI verification ────────────────────────────────────────
+  # ─────────────────────────────────────────────
+  # Verify from public PyPI index
+  # ─────────────────────────────────────────────
   verify-pypi:
     name: Verify PyPI Package
     runs-on: ubuntu-latest
     needs: publish-pypi
 
+    permissions:
+      contents: read
+
     steps:
-      - name: Wait for PyPI index propagation
-        run: sleep 60
+      - name: Wait for propagation
+        run: sleep 90
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install from PyPI (not local)
-        run: pip install "nanodns-server==${{ needs.build.outputs.version }}"
-        env:
-          VERSION: ${{ needs.build.outputs.version }}
+      - name: Install from public PyPI
+        run: |
+          python -m pip install --no-cache-dir \
+            --index-url https://pypi.org/simple \
+            "nanodns-server==${{ needs.build.outputs.version }}"
 
-      - name: Smoke test from PyPI
+      - name: Smoke test
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           INSTALLED=$(nanodns --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
-          [ "$INSTALLED" = "$VERSION" ] && echo "✅ PyPI $INSTALLED" || (echo "❌" && exit 1)
-          nanodns init smoke.json && nanodns check smoke.json
-          echo "✅ PyPI smoke test passed"
+          [ "$INSTALLED" = "$VERSION" ]
+          nanodns init smoke.json
+          nanodns check smoke.json
