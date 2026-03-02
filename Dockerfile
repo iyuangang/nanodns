@@ -13,15 +13,15 @@ RUN pip install --upgrade pip build \
  && python -m build --wheel --outdir /build/dist
 
 # 把 wheel 安装到独立前缀 /install，便于干净复制到 runtime 镜像
-# --prefix 会把 site-packages 放到 /install/lib/pythonX.Y/site-packages
-# --root  不用，prefix 更适合跨镜像复制
 RUN pip install --no-cache-dir \
       --prefix=/install \
       --force-reinstall \
       /build/dist/*.whl
 
-# 生成默认配置（在有 shell 的 builder 里执行，再复制过去）
-RUN /install/bin/nanodns init /build/nanodns.json
+# 生成默认配置
+# --prefix 安装的包不在默认 sys.path 里，需要显式设置 PYTHONPATH
+RUN PYTHONPATH=/install/lib/$(python -c "import sys; print(f'python{sys.version_info.major}.{sys.version_info.minor}')")/site-packages \
+    /install/bin/nanodns init /build/nanodns.json
 
 
 # ─── Stage 2: Chainguard distroless runtime ───────────────────────
