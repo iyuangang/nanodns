@@ -14,13 +14,12 @@ on:
         value: ${{ jobs.summarize.outputs.result }}
 
 # Skip runs triggered only by non-code commits
-# Docs/style/chore commits on branches (not tags) skip the test suite
 concurrency:
   group: test-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  # ─── Guard: skip docs/style/chore-only pushes ────────────────────────────
+  # ─── Guard: skip docs/style/chore-only pushes ──────────────────────────────
   check-commit:
     name: Check commit message
     runs-on: ubuntu-latest
@@ -34,47 +33,36 @@ jobs:
       - name: Detect skip-worthy commit messages
         id: filter
         run: |
-          # On a tag push, always run tests
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             echo "skip=false" >> $GITHUB_OUTPUT
             exit 0
           fi
-
-          # Collect commit messages in this push
           MESSAGES=$(git log --format="%s" HEAD~1..HEAD 2>/dev/null || git log --format="%s" -1)
-          echo "Commit messages:"
-          echo "$MESSAGES"
-
-          # Skip patterns: docs: style: chore: ci: build: (but NOT feat: fix: test: refactor: perf:)
           SKIP_PATTERN="^(docs|style|chore|ci|build)(\(.+\))?(!)?:"
           TOTAL=$(echo "$MESSAGES" | wc -l)
           SKIP_COUNT=$(echo "$MESSAGES" | grep -cE "$SKIP_PATTERN" || true)
-
           if [ "$SKIP_COUNT" -eq "$TOTAL" ] && [ "$TOTAL" -gt 0 ]; then
-            echo "⏭️ All commits match skip pattern — skipping tests"
             echo "skip=true" >> $GITHUB_OUTPUT
           else
-            echo "✅ Running tests"
             echo "skip=false" >> $GITHUB_OUTPUT
           fi
 
-  # ─── Unit Tests ─────────────────────────────────────────────────────────────
+  # ─── Unit Tests ────────────────────────────────────────────────────────────
   unit:
-    name: Unit Tests (Python ${{ matrix.python-version }} / ${{ matrix.os }})
+    name: Unit (${{ matrix.os }} / py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
     needs: check-commit
     if: needs.check-commit.outputs.skip != 'true'
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.10", "3.12", "3.14"]
         os: [ubuntu-latest, windows-latest, macos-latest]
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -85,15 +73,42 @@ jobs:
           pip install pytest pytest-cov
           pip install -e .
 
-      - name: Run unit tests with coverage
+      - name: Run unit tests
+        id: pytest
+        # Use continue-on-error so the report step always runs,
+        # then re-fail via the outcome check below.
+        continue-on-error: true
         run: |
-          pytest tests/ -v \
+          pytest tests/test_unit.py -v \
             --cov=nanodns \
             --cov-report=term-missing \
             --cov-report=xml:coverage-${{ matrix.os }}-${{ matrix.python-version }}.xml \
             --cov-fail-under=85
 
-      - name: Upload coverage artifact
+      # Each matrix leg writes one JSON line to a uniquely named artifact.
+      # summary job downloads all of them and builds the table dynamically —
+      # no hardcoded OS/version lists anywhere.
+      - name: Report result to artifact
+        if: always()
+        shell: bash
+        run: |
+          RESULT="${{ steps.pytest.outcome }}"
+          OS="${{ matrix.os }}"
+          PY="${{ matrix.python-version }}"
+          SUITE="unit"
+          mkdir -p results
+          echo "{\"suite\":\"${SUITE}\",\"os\":\"${OS}\",\"py\":\"${PY}\",\"result\":\"${RESULT}\"}" \
+            > results/${SUITE}-${OS}-${PY}.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          # Unique name per leg so parallel uploads don't collide
+          name: test-result-unit-${{ matrix.os }}-${{ matrix.python-version }}
+          path: results/
+          retention-days: 1
+
+      - name: Upload coverage
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
         uses: actions/upload-artifact@v4
         with:
@@ -101,22 +116,27 @@ jobs:
           path: coverage-*.xml
           retention-days: 7
 
+      # Re-fail the job if pytest failed (after artifact upload)
+      - name: Fail if tests failed
+        if: steps.pytest.outcome == 'failure'
+        run: exit 1
+
   # ─── Integration Tests ─────────────────────────────────────────────────────
   integration:
-    name: Integration Tests (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    name: Integration (${{ matrix.os }} / py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
     needs: check-commit
     if: needs.check-commit.outputs.skip != 'true'
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.12", "3.13", "3.14"]
+        os: [ubuntu-latest, windows-latest]       # matrix axis so summary reads it dynamically
+        python-version: ["3.10", "3.12", "3.14"]
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -127,9 +147,34 @@ jobs:
           pip install -e .
 
       - name: Run integration tests
+        id: pytest
+        continue-on-error: true
         run: pytest tests/test_integration.py -v --tb=short
 
-  # ─── Summarize ──────────────────────────────────────────────────────────────
+      - name: Report result to artifact
+        if: always()
+        shell: bash
+        run: |
+          RESULT="${{ steps.pytest.outcome }}"
+          OS="${{ matrix.os }}"
+          PY="${{ matrix.python-version }}"
+          SUITE="integration"
+          mkdir -p results
+          echo "{\"suite\":\"${SUITE}\",\"os\":\"${OS}\",\"py\":\"${PY}\",\"result\":\"${RESULT}\"}" \
+            > results/${SUITE}-${OS}-${PY}.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-result-integration-${{ matrix.os }}-${{ matrix.python-version }}
+          path: results/
+          retention-days: 1
+
+      - name: Fail if tests failed
+        if: steps.pytest.outcome == 'failure'
+        run: exit 1
+
+  # ─── Summarize ─────────────────────────────────────────────────────────────
   summarize:
     name: Test Summary
     runs-on: ubuntu-latest
@@ -139,73 +184,126 @@ jobs:
       result: ${{ steps.outcome.outputs.result }}
 
     steps:
-      - name: Evaluate outcomes and write matrix summary
+      # Download all per-leg result artifacts into one directory
+      - name: Download all result artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: test-result-*
+          path: all-results/
+          merge-multiple: true
+
+      - name: Build dynamic matrix summary
         id: outcome
+        shell: python
         run: |
-          UNIT="${{ needs.unit.result }}"
-          INTG="${{ needs.integration.result }}"
+          import json, os, pathlib, collections
 
-          if [[ "$UNIT" == "success" && "$INTG" == "success" ]]; then
-            echo "result=success" >> $GITHUB_OUTPUT
-            BADGE="✅ All tests passed"
-          elif [[ "$UNIT" == "skipped" && "$INTG" == "skipped" ]]; then
-            echo "result=skipped" >> $GITHUB_OUTPUT
-            BADGE="⏭️ Tests skipped (docs/style/chore commit)"
-          else
-            echo "result=failure" >> $GITHUB_OUTPUT
-            BADGE="❌ Tests failed"
-          fi
+          results_dir = pathlib.Path("all-results")
+          records = []
+          for f in results_dir.glob("*.json"):
+              try:
+                  records.append(json.loads(f.read_text()))
+              except Exception:
+                  pass
 
-          # ── helper: result → emoji ───────────────────────────────────────
-          icon() {
-            case "$1" in
-              success) echo "✅" ;;
-              failure) echo "❌" ;;
-              skipped) echo "⏭️" ;;
-              *)        echo "⚪" ;;
-            esac
-          }
+          def icon(r):
+              return {"success": "✅", "failure": "❌", "skipped": "⏭️"}.get(r, "⚪")
 
-          S=$GITHUB_STEP_SUMMARY
+          # ── derive ordered axes from actual data ──────────────────────────
+          unit_records  = [r for r in records if r["suite"] == "unit"]
+          intg_records  = [r for r in records if r["suite"] == "integration"]
 
-          echo "## $BADGE" >> $S
-          echo "" >> $S
-          echo "**Trigger:** \`${{ github.event_name }}\` · **Ref:** \`${{ github.ref_name }}\` · **SHA:** \`${{ github.sha }}\`" >> $S
-          echo "" >> $S
+          # Sorted so the table is deterministic regardless of run order
+          unit_oses = sorted({r["os"]  for r in unit_records})
+          unit_pys  = sorted({r["py"]  for r in unit_records})
+          intg_pys  = sorted({r["py"]  for r in intg_records})
 
-          # ── Unit test matrix ─────────────────────────────────────────────
-          echo "### 🧪 Unit Tests" >> $S
-          echo "" >> $S
-          echo "| OS | 3.10 | 3.11 | 3.12 |" >> $S
-          echo "|---|---|---|---|" >> $S
-          for OS in ubuntu-latest windows-latest macos-latest; do
-            # GitHub replaces matrix result context with the aggregated job
-            # result; individual cell status isn't directly available in a
-            # reusable workflow context.  Show the aggregate per-OS by
-            # reporting the overall unit result per row with the OS label.
-            ROW="| \`${OS}\` | $(icon $UNIT) | $(icon $UNIT) | $(icon $UNIT) |"
-            echo "$ROW" >> $S
-          done
-          echo "" >> $S
-          echo "> ℹ️ Individual cell status reflects the aggregated job result." >> $S
-          echo "> Enable [job summaries per matrix leg](https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/adding-a-system-diagnosis-to-your-workflow) for per-cell detail." >> $S
-          echo "" >> $S
+          # Build lookup: (suite, os, py) → result
+          lookup = {(r["suite"], r["os"], r["py"]): r["result"] for r in records}
 
-          # ── Integration test matrix ──────────────────────────────────────
-          echo "### 🔗 Integration Tests" >> $S
-          echo "" >> $S
-          echo "| OS | 3.10 | 3.12 |" >> $S
-          echo "|---|---|---|" >> $S
-          echo "| \`ubuntu-latest\` | $(icon $INTG) | $(icon $INTG) |" >> $S
-          echo "" >> $S
+          # ── overall result ────────────────────────────────────────────────
+          all_results = [r["result"] for r in records]
+          if not all_results:
+              overall = "skipped"
+          elif any(r == "failure" for r in all_results):
+              overall = "failure"
+          elif all(r == "skipped" for r in all_results):
+              overall = "skipped"
+          else:
+              overall = "success"
 
-          # ── Overall summary table ────────────────────────────────────────
-          echo "### 📊 Overall" >> $S
-          echo "" >> $S
-          echo "| Suite | Result |" >> $S
-          echo "|---|---|" >> $S
-          echo "| Unit Tests (3×OS × 3×Py) | $(icon $UNIT) \`$UNIT\` |" >> $S
-          echo "| Integration Tests (1×OS × 2×Py) | $(icon $INTG) \`$INTG\` |" >> $S
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"result={overall}\n")
+
+          badge = {"success": "✅ All tests passed",
+                   "failure": "❌ Tests failed",
+                   "skipped": "⏭️ Tests skipped"}.get(overall, "⚪ Unknown")
+
+          # ── write GITHUB_STEP_SUMMARY ─────────────────────────────────────
+          lines = []
+          a = lines.append
+
+          a(f"## {badge}")
+          a("")
+          a("**Trigger:** `${{ github.event_name }}` · "
+            "**Ref:** `${{ github.ref_name }}` · "
+            "**SHA:** `${{ github.sha }}`")
+          a("")
+
+          # Unit matrix — columns = python versions, rows = OS
+          a("### 🧪 Unit Tests")
+          a("")
+          if unit_records:
+              header = "| OS | " + " | ".join(f"py{p}" for p in unit_pys) + " |"
+              sep    = "|---|" + "---|" * len(unit_pys)
+              a(header); a(sep)
+              for os_name in unit_oses:
+                  cells = " | ".join(
+                      icon(lookup.get(("unit", os_name, py), "⚪"))
+                      for py in unit_pys
+                  )
+                  a(f"| `{os_name}` | {cells} |")
+          else:
+              a("_No results (skipped)_")
+          a("")
+
+          # Integration matrix — rows = OS, columns = python versions (both from data)
+          a("### 🔗 Integration Tests")
+          a("")
+          if intg_records:
+              intg_oses = sorted({r["os"] for r in intg_records})
+              header = "| OS | " + " | ".join(f"py{p}" for p in intg_pys) + " |"
+              sep    = "|---|" + "---|" * len(intg_pys)
+              a(header); a(sep)
+              for intg_os in intg_oses:
+                  cells = " | ".join(
+                      icon(lookup.get(("integration", intg_os, py), "⚪"))
+                      for py in intg_pys
+                  )
+                  a(f"| `{intg_os}` | {cells} |")
+          else:
+              a("_No results (skipped)_")
+          a("")
+
+          # Overall
+          intg_oses = sorted({r["os"] for r in intg_records}) if intg_records else []
+          unit_ok = all(lookup.get(("unit", o, p), "⚪") == "success"
+                        for o in unit_oses for p in unit_pys)
+          intg_ok = all(lookup.get(("integration", o, p), "⚪") == "success"
+                        for o in intg_oses for p in intg_pys)
+          unit_str = f"{len(unit_oses)}×OS × {len(unit_pys)}×Py  ({len(unit_records)} legs)"
+          intg_str = f"{len(intg_oses)}×OS × {len(intg_pys)}×Py  ({len(intg_records)} legs)"
+
+          a("### 📊 Overall")
+          a("")
+          a("| Suite | Matrix | Result |")
+          a("|---|---|---|")
+          a(f"| Unit Tests | {unit_str} | {icon('success' if unit_ok else 'failure')} |")
+          a(f"| Integration Tests | {intg_str} | {icon('success' if intg_ok else 'failure')} |")
+
+          summary_path = os.environ["GITHUB_STEP_SUMMARY"]
+          pathlib.Path(summary_path).write_text("\n".join(lines) + "\n")
+          print("\n".join(lines))
 
       - name: Fail if tests failed
         if: steps.outcome.outputs.result == 'failure'
