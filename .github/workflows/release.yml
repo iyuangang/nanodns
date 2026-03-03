@@ -263,10 +263,16 @@ jobs:
   build-docker:
     name: Build & Push OCI Image
     runs-on: ubuntu-latest
-    # On tag: wait for PyPI publish so the image and package land together.
-    # On main branch push: only depends on tests.
-    needs: ${{ startsWith(github.ref, 'refs/tags/v') && 'publish-pypi' || 'tests' }}
-    if: github.event_name != 'pull_request'
+    # needs must be a static list — expressions are not allowed here.
+    # List both upstreams; the if-condition enforces the actual gate:
+    #   tag push  → only after publish-pypi succeeded
+    #   main push → after tests succeeded (publish-pypi was skipped)
+    needs: [tests, publish-pypi]
+    if: >-
+      github.event_name != 'pull_request' && (
+        needs.publish-pypi.result == 'success' ||
+        (needs.publish-pypi.result == 'skipped' && needs.tests.result == 'success')
+      )
 
     outputs:
       digest:  ${{ steps.build.outputs.digest }}
