@@ -7,16 +7,9 @@ import asyncio
 import sys
 import os
 
-# Windows cmd.exe defaults to cp1252 which cannot encode Unicode symbols.
-# Reconfigure stdout/stderr to UTF-8 so output never crashes on Windows.
-if sys.platform == "win32":
-    import io
-    sys.stdout = io.TextIOWrapper(
-        sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True
-    )
-    sys.stderr = io.TextIOWrapper(
-        sys.stderr.buffer, encoding="utf-8", errors="replace", line_buffering=True
-    )
+# Note: stdout/stderr are NOT reconfigured at module level.
+# Doing so replaces pytest's capture objects and causes "I/O on closed file".
+# Windows encoding is handled inside main() only when actually running as CLI.
 
 from . import __version__
 from .config import load_config, generate_example_config
@@ -84,6 +77,19 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Fix Windows cp1252 encoding: reconfigure only when running as a real CLI
+    # process, never at import time (which would break pytest's stdout capture).
+    if sys.platform == "win32":
+        import io
+        if hasattr(sys.stdout, "buffer"):
+            sys.stdout = io.TextIOWrapper(
+                sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True
+            )
+        if hasattr(sys.stderr, "buffer"):
+            sys.stderr = io.TextIOWrapper(
+                sys.stderr.buffer, encoding="utf-8", errors="replace", line_buffering=True
+            )
 
     if args.command == "init":
         generate_example_config(args.output)
