@@ -128,39 +128,52 @@ jobs:
       - name: Pull by Digest
         run: docker pull ${{ env.GHCR_IMAGE }}@${{ needs.docker.outputs.digest }}
 
+      # Fix 1: Chainguard distroless 里没有 nanodns 脚本，用 python -m 替代
       - name: Verify CLI
         run: |
           docker run --rm \
-            --entrypoint nanodns \
+            --entrypoint /usr/bin/python \
             ${{ env.GHCR_IMAGE }}@${{ needs.docker.outputs.digest }} \
-            --version
+            -m nanodns.cli --version
 
       - name: Functional DNS Test
         run: |
-          cat > test.json <<EOF
+          cat > test.json <<'CONF'
           {
-            "server":{"host":"0.0.0.0","port":53,"upstream":["8.8.8.8"]},
-            "zones":{"verify.lan":{}},
-            "records":[{"name":"ping.verify.lan","type":"A","value":"1.2.3.4","ttl":60}],
-            "rewrites":[]
+            "server": {
+              "host": "0.0.0.0", "port": 53,
+              "upstream": ["8.8.8.8"], "upstream_port": 53,
+              "upstream_timeout": 3, "log_queries": false,
+              "hot_reload": false, "cache_enabled": true,
+              "cache_ttl": 300, "cache_size": 200,
+              "log_level": "WARNING"
+            },
+            "zones": {"verify.lan": {}},
+            "records": [{"name":"ping.verify.lan","type":"A","value":"1.2.3.4","ttl":60}],
+            "rewrites": []
           }
-          EOF
+          CONF
 
+          # Fix 2: 挂载到容器里实际读取的路径 /etc/nanodns.json
+          #        并显式传入 CMD 覆盖（不依赖默认 CMD）
           docker run -d --name dns-test \
             --cap-add NET_BIND_SERVICE \
             -p 5399:53/udp \
-            -v $PWD/test.json:/etc/nanodns/nanodns.json:ro \
-            ${{ env.GHCR_IMAGE }}@${{ needs.docker.outputs.digest }}
+            -v $PWD/test.json:/etc/nanodns.json:ro \
+            ${{ env.GHCR_IMAGE }}@${{ needs.docker.outputs.digest }} \
+            start --config /etc/nanodns.json
 
           sleep 5
           sudo apt-get update -qq
           sudo apt-get install -y dnsutils -qq
-          RESULT=$(dig @127.0.0.1 -p 5399 ping.verify.lan A +short)
+          RESULT=$(dig @127.0.0.1 -p 5399 ping.verify.lan A +short +time=3)
 
           docker stop dns-test
           docker rm dns-test
 
-          [ "$RESULT" = "1.2.3.4" ]
+          [ "$RESULT" = "1.2.3.4" ] \
+            && echo "✅ DNS resolved: $RESULT" \
+            || (echo "❌ Expected 1.2.3.4 got: $RESULT" && exit 1)
 
 
 # ─────────────────────────────────────────────

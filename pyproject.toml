@@ -7,7 +7,7 @@ name = "nanodns"
 version = "0.2.1"
 description = "A lightweight, JSON-configurable DNS server for internal networks"
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
 authors = [{ name = "NanoDNS Contributors" }]
 keywords = ["dns", "server", "networking", "internal", "intranet"]
 classifiers = [
@@ -15,13 +15,14 @@ classifiers = [
     "Environment :: Console",
     "Intended Audience :: System Administrators",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX :: Linux",
     "Operating System :: MacOS",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Internet :: Name Service (DNS)",
     "Topic :: System :: Networking",
 ]
