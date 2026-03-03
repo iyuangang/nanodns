@@ -1,5 +1,5 @@
 """
-Integration tests for TinyDNS.
+Integration tests for NanoDNS.
 Starts a real UDP server on a random port and sends actual DNS queries over the network.
 """
 

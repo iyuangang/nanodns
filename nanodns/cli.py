@@ -7,6 +7,17 @@ import asyncio
 import sys
 import os
 
+# Windows cmd.exe defaults to cp1252 which cannot encode Unicode symbols.
+# Reconfigure stdout/stderr to UTF-8 so output never crashes on Windows.
+if sys.platform == "win32":
+    import io
+    sys.stdout = io.TextIOWrapper(
+        sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True
+    )
+    sys.stderr = io.TextIOWrapper(
+        sys.stderr.buffer, encoding="utf-8", errors="replace", line_buffering=True
+    )
+
 from . import __version__
 from .config import load_config, generate_example_config
 from .server import setup_logging, run_server
@@ -81,14 +92,14 @@ def main():
     if args.command == "check":
         try:
             config = load_config(args.config)
-            print(f"✓ Config is valid.")
+            print(f"OK Config is valid.")
             print(f"  Records : {len(config.records)}")
             print(f"  Zones   : {len(config.zones)}")
             print(f"  Rewrites: {len(config.rewrites)}")
             print(f"  Upstream: {config.server.upstream}")
             print(f"  Listen  : {config.server.host}:{config.server.port}")
         except Exception as e:
-            print(f"✗ Config error: {e}", file=sys.stderr)
+            print(f"FAIL Config error: {e}", file=sys.stderr)
             sys.exit(1)
         return
 

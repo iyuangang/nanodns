@@ -374,7 +374,7 @@ class TestCLICheck:
 
     def test_valid_shows_summary(self, tmp_path):
         _, out, _ = _run_cli(["check", self._valid_file(tmp_path)])
-        assert any(k in out for k in ("valid", "\u2713", "Records", "Upstream"))
+        assert any(k in out for k in ("valid", "OK", "Records", "Upstream"))
 
     def test_missing_file_exit_1(self, tmp_path):
         code, _, err = _run_cli(["check", str(tmp_path / "no.json")])
