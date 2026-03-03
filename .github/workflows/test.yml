@@ -127,7 +127,7 @@ jobs:
         id: pytest
         continue-on-error: true
         run: |
-          pytest tests/test_unit.py -v --cov=nanodns --cov-report=term-missing --cov-report=xml:coverage-${{ matrix.os }}-${{ matrix.python-version }}.xml --cov-fail-under=85
+          pytest tests/ -v --cov=nanodns --cov-report=term-missing --cov-report=xml:coverage-${{ matrix.os }}-${{ matrix.python-version }}.xml --cov-fail-under=85
 
       - name: Report result to artifact
         if: always()
