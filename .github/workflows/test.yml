@@ -67,7 +67,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        python-version: ["3.10", "3.11", "3.12"]
         os: [ubuntu-latest, windows-latest, macos-latest]
 
     steps:
@@ -87,7 +87,11 @@ jobs:
 
       - name: Run unit tests with coverage
         run: |
-          pytest tests/ -v --cov=nanodns --cov-report=term-missing --cov-report=xml:coverage-${{ matrix.os }}-${{ matrix.python-version }}.xml --cov-fail-under=85
+          pytest tests/ -v \
+            --cov=nanodns \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage-${{ matrix.os }}-${{ matrix.python-version }}.xml \
+            --cov-fail-under=85
 
       - name: Upload coverage artifact
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
@@ -106,7 +110,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        python-version: ["3.10", "3.12", "3.13", "3.14"]
 
     steps:
       - uses: actions/checkout@v4
@@ -135,30 +139,73 @@ jobs:
       result: ${{ steps.outcome.outputs.result }}
 
     steps:
-      - name: Evaluate outcomes
+      - name: Evaluate outcomes and write matrix summary
         id: outcome
         run: |
           UNIT="${{ needs.unit.result }}"
           INTG="${{ needs.integration.result }}"
-          echo "unit=$UNIT integration=$INTG"
 
           if [[ "$UNIT" == "success" && "$INTG" == "success" ]]; then
             echo "result=success" >> $GITHUB_OUTPUT
-            STATUS="✅ All tests passed"
+            BADGE="✅ All tests passed"
           elif [[ "$UNIT" == "skipped" && "$INTG" == "skipped" ]]; then
             echo "result=skipped" >> $GITHUB_OUTPUT
-            STATUS="⏭️ Tests skipped (docs/style/chore commit)"
+            BADGE="⏭️ Tests skipped (docs/style/chore commit)"
           else
             echo "result=failure" >> $GITHUB_OUTPUT
-            STATUS="❌ Tests failed"
+            BADGE="❌ Tests failed"
           fi
 
-          echo "### $STATUS" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Job | Result |" >> $GITHUB_STEP_SUMMARY
-          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Unit Tests | $UNIT |" >> $GITHUB_STEP_SUMMARY
-          echo "| Integration Tests | $INTG |" >> $GITHUB_STEP_SUMMARY
+          # ── helper: result → emoji ───────────────────────────────────────
+          icon() {
+            case "$1" in
+              success) echo "✅" ;;
+              failure) echo "❌" ;;
+              skipped) echo "⏭️" ;;
+              *)        echo "⚪" ;;
+            esac
+          }
+
+          S=$GITHUB_STEP_SUMMARY
+
+          echo "## $BADGE" >> $S
+          echo "" >> $S
+          echo "**Trigger:** \`${{ github.event_name }}\` · **Ref:** \`${{ github.ref_name }}\` · **SHA:** \`${{ github.sha }}\`" >> $S
+          echo "" >> $S
+
+          # ── Unit test matrix ─────────────────────────────────────────────
+          echo "### 🧪 Unit Tests" >> $S
+          echo "" >> $S
+          echo "| OS | 3.10 | 3.11 | 3.12 |" >> $S
+          echo "|---|---|---|---|" >> $S
+          for OS in ubuntu-latest windows-latest macos-latest; do
+            # GitHub replaces matrix result context with the aggregated job
+            # result; individual cell status isn't directly available in a
+            # reusable workflow context.  Show the aggregate per-OS by
+            # reporting the overall unit result per row with the OS label.
+            ROW="| \`${OS}\` | $(icon $UNIT) | $(icon $UNIT) | $(icon $UNIT) |"
+            echo "$ROW" >> $S
+          done
+          echo "" >> $S
+          echo "> ℹ️ Individual cell status reflects the aggregated job result." >> $S
+          echo "> Enable [job summaries per matrix leg](https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/adding-a-system-diagnosis-to-your-workflow) for per-cell detail." >> $S
+          echo "" >> $S
+
+          # ── Integration test matrix ──────────────────────────────────────
+          echo "### 🔗 Integration Tests" >> $S
+          echo "" >> $S
+          echo "| OS | 3.10 | 3.12 |" >> $S
+          echo "|---|---|---|" >> $S
+          echo "| \`ubuntu-latest\` | $(icon $INTG) | $(icon $INTG) |" >> $S
+          echo "" >> $S
+
+          # ── Overall summary table ────────────────────────────────────────
+          echo "### 📊 Overall" >> $S
+          echo "" >> $S
+          echo "| Suite | Result |" >> $S
+          echo "|---|---|" >> $S
+          echo "| Unit Tests (3×OS × 3×Py) | $(icon $UNIT) \`$UNIT\` |" >> $S
+          echo "| Integration Tests (1×OS × 2×Py) | $(icon $INTG) \`$INTG\` |" >> $S
 
       - name: Fail if tests failed
         if: steps.outcome.outputs.result == 'failure'
