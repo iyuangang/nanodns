@@ -112,7 +112,7 @@ jobs:
         run: twine check dist/*
 
       - name: Generate SHA256 checksums
-        run: sha256sum dist/* > dist/SHA256SUMS
+        run: sha256sum dist/*.whl dist/*.tar.gz > SHA256SUMS
 
       - name: Capture filenames
         id: filenames
@@ -224,7 +224,7 @@ jobs:
           files: |
             dist/*.whl
             dist/*.tar.gz
-            dist/SHA256SUMS
+            SHA256SUMS
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -253,6 +253,10 @@ jobs:
       - name: Publish via Trusted Publishing (OIDC)
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
+          # Only upload recognized distribution files (.whl, .tar.gz).
+          # SHA256SUMS is intentionally kept outside dist/ to avoid
+          # InvalidDistribution errors from the publish action.
+          packages-dir: dist/
           skip-existing: false
           verbose: true
 
