@@ -267,16 +267,12 @@ jobs:
   build-docker:
     name: Build & Push OCI Image
     runs-on: ubuntu-latest
-    # needs must be a static list — expressions are not allowed here.
-    # List both upstreams; the if-condition enforces the actual gate:
-    #   tag push  → only after publish-pypi succeeded
-    #   main push → after tests succeeded (publish-pypi was skipped)
-    needs: [tests, publish-pypi]
-    if: >-
-      github.event_name != 'pull_request' && (
-        needs.publish-pypi.result == 'success' ||
-        (needs.publish-pypi.result == 'skipped' && needs.tests.result == 'success')
-      )
+    # Docker build runs independently of PyPI publish:
+    #   tag push  → after tests (parallel with PyPI pipeline)
+    #   main push → after tests
+    #   PR        → skipped
+    needs: tests
+    if: github.event_name != 'pull_request'
 
     outputs:
       digest:  ${{ steps.build.outputs.digest }}
@@ -493,7 +489,10 @@ jobs:
   verify-signature:
     name: Verify Signature & Provenance
     runs-on: ubuntu-latest
-    needs: sign
+    # Must list build-docker directly to access its digest output.
+    # needs: sign alone is not enough — outputs are only visible from
+    # the job that produced them, not transitively through dependents.
+    needs: [sign, build-docker]
     if: startsWith(github.ref, 'refs/tags/v')
 
     steps:
