@@ -79,7 +79,7 @@ jobs:
         # then re-fail via the outcome check below.
         continue-on-error: true
         run: |
-          pytest tests/test_unit.py -v \
+          pytest tests/ -v \
             --cov=nanodns \
             --cov-report=term-missing \
             --cov-report=xml:coverage-${{ matrix.os }}-${{ matrix.python-version }}.xml \
