@@ -1,50 +1,100 @@
 name: Tests
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Commit prefix convention
+# ──────────────────────────────────────────────────────────────────────────────
+#
+#  Prefix          Tests   Docker build   PyPI release
+#  ─────────────── ─────── ────────────── ─────────────
+#  feat:           ✅       ✅ (on main)   🏷️ (on tag)
+#  fix:            ✅       ✅             🏷️
+#  perf:           ✅       ✅             🏷️
+#  refactor:       ✅       ✅             🏷️
+#  test:           ✅       ⏭️  skip       ⏭️
+#  ci:             ✅       ⏭️  skip       ⏭️
+#  build:          ✅       ⏭️  skip       ⏭️
+#  docs:           ⏭️ skip  ⏭️  skip       ⏭️
+#  style:          ⏭️ skip  ⏭️  skip       ⏭️
+#  chore:          ⏭️ skip  ⏭️  skip       ⏭️
+#
+#  Tags (v*) always run the full pipeline regardless of commit prefix.
+#
+# This file handles:  Tests + skip logic + summary
+# release.yml reads:  tests.outputs.result + tests.outputs.skip_docker
+# ──────────────────────────────────────────────────────────────────────────────
+
 on:
   push:
     branches: ["**"]
   pull_request:
     branches: ["**"]
-
-  # Allow other workflows to call this one as a reusable workflow
   workflow_call:
     outputs:
       result:
-        description: "Test outcome: success or failure"
+        description: "success | failure | skipped"
         value: ${{ jobs.summarize.outputs.result }}
+      skip_docker:
+        description: "true when commit is test:/ci:/build: (no code change warrants image rebuild)"
+        value: ${{ jobs.check-commit.outputs.skip_docker }}
 
-# Skip runs triggered only by non-code commits
 concurrency:
   group: test-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  # ─── Guard: skip docs/style/chore-only pushes ──────────────────────────────
+
+  # ─── Guard ─────────────────────────────────────────────────────────────────
   check-commit:
-    name: Check commit message
+    name: Classify commit
     runs-on: ubuntu-latest
     outputs:
-      skip: ${{ steps.filter.outputs.skip }}
+      skip_tests:  ${{ steps.classify.outputs.skip_tests }}
+      skip_docker: ${{ steps.classify.outputs.skip_docker }}
+
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 2
 
-      - name: Detect skip-worthy commit messages
-        id: filter
+      - name: Classify commit prefixes
+        id: classify
         run: |
+          # Tags always run everything
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            echo "skip=false" >> $GITHUB_OUTPUT
+            echo "skip_tests=false"  >> $GITHUB_OUTPUT
+            echo "skip_docker=false" >> $GITHUB_OUTPUT
+            echo "▶ Tag push — full pipeline"
             exit 0
           fi
-          MESSAGES=$(git log --format="%s" HEAD~1..HEAD 2>/dev/null || git log --format="%s" -1)
-          SKIP_PATTERN="^(docs|style|chore|ci|build)(\(.+\))?(!)?:"
+
+          MESSAGES=$(git log --format="%s" HEAD~1..HEAD 2>/dev/null \
+                     || git log --format="%s" -1)
+          echo "Commits in this push:"
+          echo "$MESSAGES"
+
+          # Prefixes that skip tests entirely (and therefore also Docker/PyPI)
+          SKIP_TESTS_PAT="^(docs|style|chore)(\(.+\))?(!)?:"
+
+          # Prefixes that run tests but skip Docker image rebuild
+          # (no production code changed, image content is identical)
+          SKIP_DOCKER_PAT="^(test|ci|build)(\(.+\))?(!)?:"
+
           TOTAL=$(echo "$MESSAGES" | wc -l)
-          SKIP_COUNT=$(echo "$MESSAGES" | grep -cE "$SKIP_PATTERN" || true)
-          if [ "$SKIP_COUNT" -eq "$TOTAL" ] && [ "$TOTAL" -gt 0 ]; then
-            echo "skip=true" >> $GITHUB_OUTPUT
+          SKIP_T=$(echo "$MESSAGES" | grep -cE "$SKIP_TESTS_PAT"  || true)
+          SKIP_D=$(echo "$MESSAGES" | grep -cE "$SKIP_DOCKER_PAT" || true)
+
+          if [ "$SKIP_T" -eq "$TOTAL" ] && [ "$TOTAL" -gt 0 ]; then
+            echo "skip_tests=true"  >> $GITHUB_OUTPUT
+            echo "skip_docker=true" >> $GITHUB_OUTPUT
+            echo "⏭ All commits match skip-tests pattern (docs/style/chore)"
+          elif [ "$((SKIP_T + SKIP_D))" -eq "$TOTAL" ] && [ "$TOTAL" -gt 0 ]; then
+            echo "skip_tests=false"  >> $GITHUB_OUTPUT
+            echo "skip_docker=true"  >> $GITHUB_OUTPUT
+            echo "▶ Tests will run  ⏭ Docker will be skipped (test/ci/build commit)"
           else
-            echo "skip=false" >> $GITHUB_OUTPUT
+            echo "skip_tests=false"  >> $GITHUB_OUTPUT
+            echo "skip_docker=false" >> $GITHUB_OUTPUT
+            echo "▶ Full pipeline (feat/fix/perf/refactor or mixed)"
           fi
 
   # ─── Unit Tests ────────────────────────────────────────────────────────────
@@ -52,7 +102,7 @@ jobs:
     name: Unit (${{ matrix.os }} / py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
     needs: check-commit
-    if: needs.check-commit.outputs.skip != 'true'
+    if: needs.check-commit.outputs.skip_tests != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -75,31 +125,21 @@ jobs:
 
       - name: Run unit tests
         id: pytest
-        # Use continue-on-error so the report step always runs,
-        # then re-fail via the outcome check below.
         continue-on-error: true
         run: |
-          pytest tests/ -v --cov=nanodns --cov-report=term-missing --cov-report=xml:coverage-${{ matrix.os }}-${{ matrix.python-version }}.xml --cov-fail-under=85
+          pytest tests/test_unit.py -v --cov=nanodns --cov-report=term-missing --cov-report=xml:coverage-${{ matrix.os }}-${{ matrix.python-version }}.xml --cov-fail-under=85
 
-      # Each matrix leg writes one JSON line to a uniquely named artifact.
-      # summary job downloads all of them and builds the table dynamically —
-      # no hardcoded OS/version lists anywhere.
       - name: Report result to artifact
         if: always()
         shell: bash
         run: |
-          RESULT="${{ steps.pytest.outcome }}"
-          OS="${{ matrix.os }}"
-          PY="${{ matrix.python-version }}"
-          SUITE="unit"
           mkdir -p results
-          echo "{\"suite\":\"${SUITE}\",\"os\":\"${OS}\",\"py\":\"${PY}\",\"result\":\"${RESULT}\"}" \
-            > results/${SUITE}-${OS}-${PY}.json
+          echo "{\"suite\":\"unit\",\"os\":\"${{ matrix.os }}\",\"py\":\"${{ matrix.python-version }}\",\"result\":\"${{ steps.pytest.outcome }}\"}" \
+            > results/unit-${{ matrix.os }}-${{ matrix.python-version }}.json
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          # Unique name per leg so parallel uploads don't collide
           name: test-result-unit-${{ matrix.os }}-${{ matrix.python-version }}
           path: results/
           retention-days: 1
@@ -112,7 +152,6 @@ jobs:
           path: coverage-*.xml
           retention-days: 7
 
-      # Re-fail the job if pytest failed (after artifact upload)
       - name: Fail if tests failed
         if: steps.pytest.outcome == 'failure'
         run: exit 1
@@ -122,11 +161,11 @@ jobs:
     name: Integration (${{ matrix.os }} / py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
     needs: check-commit
-    if: needs.check-commit.outputs.skip != 'true'
+    if: needs.check-commit.outputs.skip_tests != 'true'
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]       # matrix axis so summary reads it dynamically
+        os: [ubuntu-latest, windows-latest]
         python-version: ["3.10", "3.12", "3.14"]
 
     steps:
@@ -151,13 +190,9 @@ jobs:
         if: always()
         shell: bash
         run: |
-          RESULT="${{ steps.pytest.outcome }}"
-          OS="${{ matrix.os }}"
-          PY="${{ matrix.python-version }}"
-          SUITE="integration"
           mkdir -p results
-          echo "{\"suite\":\"${SUITE}\",\"os\":\"${OS}\",\"py\":\"${PY}\",\"result\":\"${RESULT}\"}" \
-            > results/${SUITE}-${OS}-${PY}.json
+          echo "{\"suite\":\"integration\",\"os\":\"${{ matrix.os }}\",\"py\":\"${{ matrix.python-version }}\",\"result\":\"${{ steps.pytest.outcome }}\"}" \
+            > results/integration-${{ matrix.os }}-${{ matrix.python-version }}.json
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -174,131 +209,150 @@ jobs:
   summarize:
     name: Test Summary
     runs-on: ubuntu-latest
-    needs: [unit, integration]
+    needs: [check-commit, unit, integration]
     if: always()
     outputs:
       result: ${{ steps.outcome.outputs.result }}
 
     steps:
-      # Download all per-leg result artifacts into one directory
       - name: Download all result artifacts
+        # Will silently succeed even when no artifacts exist (skipped run)
         uses: actions/download-artifact@v4
         with:
           pattern: test-result-*
           path: all-results/
           merge-multiple: true
+        continue-on-error: true
 
       - name: Build dynamic matrix summary
         id: outcome
         shell: python
         run: |
-          import json, os, pathlib, collections
+          import json, os, pathlib
+
+          skip_tests  = "${{ needs.check-commit.outputs.skip_tests }}"  == "true"
+          skip_docker = "${{ needs.check-commit.outputs.skip_docker }}" == "true"
 
           results_dir = pathlib.Path("all-results")
           records = []
-          for f in results_dir.glob("*.json"):
-              try:
-                  records.append(json.loads(f.read_text()))
-              except Exception:
-                  pass
+          if results_dir.exists():
+              for f in results_dir.glob("*.json"):
+                  try:
+                      records.append(json.loads(f.read_text()))
+                  except Exception:
+                      pass
 
           def icon(r):
               return {"success": "✅", "failure": "❌", "skipped": "⏭️"}.get(r, "⚪")
 
-          # ── derive ordered axes from actual data ──────────────────────────
-          unit_records  = [r for r in records if r["suite"] == "unit"]
-          intg_records  = [r for r in records if r["suite"] == "integration"]
+          unit_records = [r for r in records if r["suite"] == "unit"]
+          intg_records = [r for r in records if r["suite"] == "integration"]
 
-          # Sorted so the table is deterministic regardless of run order
-          unit_oses = sorted({r["os"]  for r in unit_records})
-          unit_pys  = sorted({r["py"]  for r in unit_records})
-          intg_pys  = sorted({r["py"]  for r in intg_records})
+          unit_oses = sorted({r["os"] for r in unit_records})
+          unit_pys  = sorted({r["py"] for r in unit_records})
+          intg_oses = sorted({r["os"] for r in intg_records})
+          intg_pys  = sorted({r["py"] for r in intg_records})
+          lookup    = {(r["suite"], r["os"], r["py"]): r["result"] for r in records}
 
-          # Build lookup: (suite, os, py) → result
-          lookup = {(r["suite"], r["os"], r["py"]): r["result"] for r in records}
-
-          # ── overall result ────────────────────────────────────────────────
           all_results = [r["result"] for r in records]
-          if not all_results:
+          if skip_tests:
+              overall = "skipped"
+          elif not all_results:
               overall = "skipped"
           elif any(r == "failure" for r in all_results):
               overall = "failure"
-          elif all(r == "skipped" for r in all_results):
-              overall = "skipped"
           else:
               overall = "success"
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
               fh.write(f"result={overall}\n")
 
-          badge = {"success": "✅ All tests passed",
-                   "failure": "❌ Tests failed",
-                   "skipped": "⏭️ Tests skipped"}.get(overall, "⚪ Unknown")
+          badge = {
+              "success": "✅ All tests passed",
+              "failure": "❌ Tests failed",
+              "skipped": "⏭️ Tests skipped",
+          }.get(overall, "⚪ Unknown")
 
-          # ── write GITHUB_STEP_SUMMARY ─────────────────────────────────────
           lines = []
           a = lines.append
 
           a(f"## {badge}")
           a("")
-          a("**Trigger:** `${{ github.event_name }}` · "
-            "**Ref:** `${{ github.ref_name }}` · "
-            "**SHA:** `${{ github.sha }}`")
+          a(
+            f"**Trigger:** `${{ github.event_name }}` · "
+            f"**Ref:** `${{ github.ref_name }}` · "
+            f"**SHA:** `${{ github.sha }}`"
+          )
           a("")
 
-          # Unit matrix — columns = python versions, rows = OS
-          a("### 🧪 Unit Tests")
+          # ── Commit classification legend ───────────────────────────────────
+          a("### 📋 Commit Classification")
           a("")
-          if unit_records:
-              header = "| OS | " + " | ".join(f"py{p}" for p in unit_pys) + " |"
-              sep    = "|---|" + "---|" * len(unit_pys)
-              a(header); a(sep)
-              for os_name in unit_oses:
-                  cells = " | ".join(
-                      icon(lookup.get(("unit", os_name, py), "⚪"))
-                      for py in unit_pys
-                  )
-                  a(f"| `{os_name}` | {cells} |")
+          a("| Prefix | Tests | Docker | PyPI |")
+          a("|---|---|---|---|")
+          a("| `feat` `fix` `perf` `refactor` | ✅ | ✅ | 🏷️ on tag |")
+          a("| `test` `ci` `build` | ✅ | ⏭️ skip | ⏭️ skip |")
+          a("| `docs` `style` `chore` | ⏭️ skip | ⏭️ skip | ⏭️ skip |")
+          a("")
+          skip_d_icon = "⏭️ skipped" if skip_docker else "✅ will run"
+          skip_t_icon = "⏭️ skipped" if skip_tests  else "✅ ran"
+          a(f"> This run — Tests: **{skip_t_icon}** · Docker: **{skip_d_icon}**")
+          a("")
+
+          if skip_tests:
+              a("_Tests were skipped for this commit. No matrix results to show._")
           else:
-              a("_No results (skipped)_")
-          a("")
+              # ── Unit matrix ────────────────────────────────────────────────
+              a("### 🧪 Unit Tests")
+              a("")
+              if unit_records:
+                  header = "| OS | " + " | ".join(f"py{p}" for p in unit_pys) + " |"
+                  sep    = "|---|" + "---|" * len(unit_pys)
+                  a(header); a(sep)
+                  for os_name in unit_oses:
+                      cells = " | ".join(
+                          icon(lookup.get(("unit", os_name, py), "⚪"))
+                          for py in unit_pys
+                      )
+                      a(f"| `{os_name}` | {cells} |")
+              else:
+                  a("_No results_")
+              a("")
 
-          # Integration matrix — rows = OS, columns = python versions (both from data)
-          a("### 🔗 Integration Tests")
-          a("")
-          if intg_records:
-              intg_oses = sorted({r["os"] for r in intg_records})
-              header = "| OS | " + " | ".join(f"py{p}" for p in intg_pys) + " |"
-              sep    = "|---|" + "---|" * len(intg_pys)
-              a(header); a(sep)
-              for intg_os in intg_oses:
-                  cells = " | ".join(
-                      icon(lookup.get(("integration", intg_os, py), "⚪"))
-                      for py in intg_pys
-                  )
-                  a(f"| `{intg_os}` | {cells} |")
-          else:
-              a("_No results (skipped)_")
-          a("")
+              # ── Integration matrix ─────────────────────────────────────────
+              a("### 🔗 Integration Tests")
+              a("")
+              if intg_records:
+                  header = "| OS | " + " | ".join(f"py{p}" for p in intg_pys) + " |"
+                  sep    = "|---|" + "---|" * len(intg_pys)
+                  a(header); a(sep)
+                  for os_name in intg_oses:
+                      cells = " | ".join(
+                          icon(lookup.get(("integration", os_name, py), "⚪"))
+                          for py in intg_pys
+                      )
+                      a(f"| `{os_name}` | {cells} |")
+              else:
+                  a("_No results_")
+              a("")
 
-          # Overall
-          intg_oses = sorted({r["os"] for r in intg_records}) if intg_records else []
-          unit_ok = all(lookup.get(("unit", o, p), "⚪") == "success"
-                        for o in unit_oses for p in unit_pys)
-          intg_ok = all(lookup.get(("integration", o, p), "⚪") == "success"
-                        for o in intg_oses for p in intg_pys)
-          unit_str = f"{len(unit_oses)}×OS × {len(unit_pys)}×Py  ({len(unit_records)} legs)"
-          intg_str = f"{len(intg_oses)}×OS × {len(intg_pys)}×Py  ({len(intg_records)} legs)"
+              # ── Overall ────────────────────────────────────────────────────
+              unit_ok = bool(unit_records) and all(
+                  lookup.get(("unit", o, p)) == "success"
+                  for o in unit_oses for p in unit_pys
+              )
+              intg_ok = bool(intg_records) and all(
+                  lookup.get(("integration", o, p)) == "success"
+                  for o in intg_oses for p in intg_pys
+              )
+              a("### 📊 Overall")
+              a("")
+              a("| Suite | Matrix | Result |")
+              a("|---|---|---|")
+              a(f"| Unit | {len(unit_oses)}×OS × {len(unit_pys)}×Py ({len(unit_records)} legs) | {icon('success' if unit_ok else 'failure')} |")
+              a(f"| Integration | {len(intg_oses)}×OS × {len(intg_pys)}×Py ({len(intg_records)} legs) | {icon('success' if intg_ok else 'failure')} |")
 
-          a("### 📊 Overall")
-          a("")
-          a("| Suite | Matrix | Result |")
-          a("|---|---|---|")
-          a(f"| Unit Tests | {unit_str} | {icon('success' if unit_ok else 'failure')} |")
-          a(f"| Integration Tests | {intg_str} | {icon('success' if intg_ok else 'failure')} |")
-
-          summary_path = os.environ["GITHUB_STEP_SUMMARY"]
-          pathlib.Path(summary_path).write_text("\n".join(lines) + "\n")
+          pathlib.Path(os.environ["GITHUB_STEP_SUMMARY"]).write_text("\n".join(lines) + "\n")
           print("\n".join(lines))
 
       - name: Fail if tests failed

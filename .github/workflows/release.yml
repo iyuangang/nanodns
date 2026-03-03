@@ -1,10 +1,18 @@
 name: Release — PyPI & OCI
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Triggers
-#   tag v*   → full pipeline: test → build PyPI → build Docker → sign → publish
-#   main     → build + push Docker only (no PyPI, no sign)
-#   PR       → test + build-only (nothing pushed)
+# Trigger × Commit prefix matrix
+#
+#  Trigger  Prefix                  Tests  Docker  PyPI
+#  ───────  ──────────────────────  ─────  ──────  ────
+#  tag v*   any                     ✅     ✅      ✅
+#  main     feat/fix/perf/refactor  ✅     ✅      —
+#  main     test/ci/build           ✅     ⏭️      —
+#  main     docs/style/chore        ⏭️     ⏭️      —
+#  PR       any                     ✅*    ⏭️      —
+#
+#  * PR tests run via test.yml directly, not this workflow
+#  Docker skip signal comes from test.yml → tests.outputs.skip_docker
 # ──────────────────────────────────────────────────────────────────────────────
 on:
   push:
@@ -39,6 +47,7 @@ jobs:
     uses: ./.github/workflows/test.yml
     permissions:
       contents: read
+    # Exposes outputs: result, skip_docker
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -48,7 +57,8 @@ jobs:
     name: Build PyPI Distribution
     runs-on: ubuntu-latest
     needs: tests
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Only on tags AND only if tests actually ran (not skipped by docs/style/chore commit)
+    if: startsWith(github.ref, 'refs/tags/v') && needs.tests.outputs.result != 'skipped'
 
     permissions:
       contents: read
@@ -267,12 +277,15 @@ jobs:
   build-docker:
     name: Build & Push OCI Image
     runs-on: ubuntu-latest
-    # Docker build runs independently of PyPI publish:
-    #   tag push  → after tests (parallel with PyPI pipeline)
-    #   main push → after tests
-    #   PR        → skipped
+    # Skipped when:
+    #   • PR (never push images from PRs)
+    #   • tests were skipped entirely (docs/style/chore commit — no code changed)
+    #   • skip_docker=true (test/ci/build commit — image content unchanged)
     needs: tests
-    if: github.event_name != 'pull_request'
+    if: >-
+      github.event_name != 'pull_request' &&
+      needs.tests.outputs.result != 'skipped' &&
+      needs.tests.outputs.skip_docker != 'true'
 
     outputs:
       digest:  ${{ steps.build.outputs.digest }}
