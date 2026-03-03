@@ -1,13 +1,29 @@
-name: Release & Publish to PyPI
+name: Release — PyPI & OCI
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Triggers
+#   tag v*   → full pipeline: test → build PyPI → build Docker → sign → publish
+#   main     → build + push Docker only (no PyPI, no sign)
+#   PR       → test + build-only (nothing pushed)
+# ──────────────────────────────────────────────────────────────────────────────
 on:
   push:
     tags:
       - "v*"
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+env:
+  GHCR_IMAGE:      ghcr.io/${{ github.repository_owner }}/nanodns
+  DOCKERHUB_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/nanodns
 
 permissions:
   contents: read
-  id-token: none
+  packages: write
+  id-token: write
 
 concurrency:
   group: release-${{ github.ref }}
@@ -15,50 +31,46 @@ concurrency:
 
 jobs:
 
-  # ─────────────────────────────────────────────
-  # Tests (reuse shared workflow)
-  # ─────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# 1️⃣  TESTS  (shared workflow, runs on every trigger)
+# ══════════════════════════════════════════════════════════════════════════════
   tests:
-    name: Run Tests
+    name: Tests
     uses: ./.github/workflows/test.yml
     permissions:
       contents: read
 
-  # ─────────────────────────────────────────────
-  # Build
-  # ─────────────────────────────────────────────
-  build:
-    name: Build Distribution
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2️⃣  BUILD PyPI DISTRIBUTION  (tag only)
+# ══════════════════════════════════════════════════════════════════════════════
+  build-pypi:
+    name: Build PyPI Distribution
     runs-on: ubuntu-latest
     needs: tests
+    if: startsWith(github.ref, 'refs/tags/v')
 
     permissions:
       contents: read
 
     outputs:
-      version: ${{ steps.version.outputs.version }}
-      whl-name: ${{ steps.filenames.outputs.whl }}
+      version:    ${{ steps.version.outputs.version }}
+      whl-name:   ${{ steps.filenames.outputs.whl }}
       sdist-name: ${{ steps.filenames.outputs.sdist }}
 
     env:
       PYTHONHASHSEED: "0"
-      # ❌ 不能用 github.event.head_commit.timestamp：
-      #    它是 ISO 8601 字符串（如 2026-03-03T09:38:59+08:00），
-      #    wheel 的 get_zipinfo_datetime() 调用 int() 解析时直接报 ValueError。
-      # ✅ 在 Build step 里用 git log -1 --format=%ct 获取 Unix 整数秒。
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Upgrade pip (isolated)
+      - name: Install build tools
         run: |
           python -m pip install --upgrade pip
           pip install --upgrade build twine
@@ -71,9 +83,9 @@ jobs:
 
       - name: Verify pyproject.toml version matches tag
         run: |
-          PROJECT_VERSION=$(python - <<EOF
+          PROJECT_VERSION=$(python - <<'EOF'
           import tomllib
-          with open("pyproject.toml","rb") as f:
+          with open("pyproject.toml", "rb") as f:
             print(tomllib.load(f)["project"]["version"])
           EOF
           )
@@ -89,8 +101,8 @@ jobs:
 
       - name: Build sdist and wheel (reproducible)
         run: |
-          # git log -1 --format=%ct → commit 的 Unix 时间戳（整数秒）
-          # 比 github.event.head_commit.timestamp 可靠，无需格式转换
+          # git log -1 --format=%ct → Unix integer seconds, no format conversion needed
+          # github.event.head_commit.timestamp is ISO 8601 and breaks wheel's int()
           SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
           export SOURCE_DATE_EPOCH
           echo "SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}"
@@ -105,7 +117,7 @@ jobs:
       - name: Capture filenames
         id: filenames
         run: |
-          echo "whl=$(basename dist/*.whl)" >> $GITHUB_OUTPUT
+          echo "whl=$(basename dist/*.whl)"     >> $GITHUB_OUTPUT
           echo "sdist=$(basename dist/*.tar.gz)" >> $GITHUB_OUTPUT
 
       - uses: actions/upload-artifact@v4
@@ -114,13 +126,15 @@ jobs:
           path: dist/
           retention-days: 3
 
-  # ─────────────────────────────────────────────
-  # Verify WHL cross-platform
-  # ─────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3️⃣  VERIFY WHEEL — cross-platform matrix  (tag only)
+# ══════════════════════════════════════════════════════════════════════════════
   verify-whl:
     name: Verify WHL (${{ matrix.os }} / Py ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
-    needs: build
+    needs: build-pypi
+    if: startsWith(github.ref, 'refs/tags/v')
 
     strategy:
       fail-fast: false
@@ -141,29 +155,34 @@ jobs:
           name: dist
           path: dist/
 
-      - name: Install wheel (no cache)
-        run: python -m pip install --no-cache-dir dist/${{ needs.build.outputs.whl-name }}
+      - name: Install wheel
+        run: python -m pip install --no-cache-dir dist/${{ needs.build-pypi.outputs.whl-name }}
 
       - name: Verify CLI version
         shell: bash
         run: |
           INSTALLED=$(nanodns --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
-          EXPECTED="${{ needs.build.outputs.version }}"
-          [ "$INSTALLED" = "$EXPECTED" ]
+          EXPECTED="${{ needs.build-pypi.outputs.version }}"
+          [ "$INSTALLED" = "$EXPECTED" ] \
+            && echo "✅ $INSTALLED" \
+            || (echo "❌ $INSTALLED != $EXPECTED" && exit 1)
 
       - name: Smoke test
         shell: bash
         run: |
           nanodns init verify.json
           nanodns check verify.json
+          echo "✅ init/check OK"
 
-  # ─────────────────────────────────────────────
-  # GitHub Release
-  # ─────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4️⃣  GITHUB RELEASE  (tag only, after wheel verification)
+# ══════════════════════════════════════════════════════════════════════════════
   github-release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
     needs: verify-whl
+    if: startsWith(github.ref, 'refs/tags/v')
 
     permissions:
       contents: write
@@ -197,23 +216,25 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          name: "NanoDNS ${{ github.ref_name }}"
-          body: ${{ steps.changelog.outputs.changelog }}
-          draft: false
+          tag_name:   ${{ github.ref_name }}
+          name:       "NanoDNS ${{ github.ref_name }}"
+          body:       ${{ steps.changelog.outputs.changelog }}
+          draft:      false
           prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
             dist/*.whl
             dist/*.tar.gz
             dist/SHA256SUMS
 
-  # ─────────────────────────────────────────────
-  # Publish to PyPI (Trusted Publishing OIDC)
-  # ─────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5️⃣  PUBLISH TO PyPI  (tag only, after GitHub release)
+# ══════════════════════════════════════════════════════════════════════════════
   publish-pypi:
     name: Publish to PyPI
     runs-on: ubuntu-latest
     needs: github-release
+    if: startsWith(github.ref, 'refs/tags/v')
 
     permissions:
       id-token: write
@@ -229,41 +250,322 @@ jobs:
           name: dist
           path: dist/
 
-      - name: Publish via Trusted Publishing
+      - name: Publish via Trusted Publishing (OIDC)
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           skip-existing: false
           verbose: true
 
-  # ─────────────────────────────────────────────
-  # Verify from public PyPI index
-  # ─────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 6️⃣  BUILD & PUSH DOCKER IMAGE  (tag + main, skip PR)
+# ══════════════════════════════════════════════════════════════════════════════
+  build-docker:
+    name: Build & Push OCI Image
+    runs-on: ubuntu-latest
+    # On tag: wait for PyPI publish so the image and package land together.
+    # On main branch push: only depends on tests.
+    needs: ${{ startsWith(github.ref, 'refs/tags/v') && 'publish-pypi' || 'tests' }}
+    if: github.event_name != 'pull_request'
+
+    outputs:
+      digest:  ${{ steps.build.outputs.digest }}
+      version: ${{ steps.meta.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.GHCR_IMAGE }}
+            ${{ env.DOCKERHUB_IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=ref,event=branch
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=NanoDNS
+            org.opencontainers.image.description=Lightweight JSON-configurable DNS server
+            org.opencontainers.image.vendor=NanoDNS Contributors
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+      - name: Build & Push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags:   ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            BUILD_DATE=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
+            GIT_REVISION=${{ github.sha }}
+            REPO_URL=https://github.com/${{ github.repository }}
+          cache-from: |
+            type=gha
+            type=registry,ref=${{ env.GHCR_IMAGE }}:buildcache
+          cache-to: |
+            type=gha,mode=max
+            type=registry,ref=${{ env.GHCR_IMAGE }}:buildcache,mode=max
+          provenance: true
+          sbom: true
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 7️⃣  VERIFY DOCKER RUNTIME  (amd64)
+# ══════════════════════════════════════════════════════════════════════════════
+  verify-docker:
+    name: Verify Docker Runtime
+    runs-on: ubuntu-latest
+    needs: build-docker
+    if: github.event_name != 'pull_request'
+
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull by digest
+        run: docker pull ${{ env.GHCR_IMAGE }}@${{ needs.build-docker.outputs.digest }}
+
+      - name: Verify CLI (python -m, distroless-compatible)
+        run: |
+          docker run --rm \
+            --entrypoint /usr/bin/python \
+            ${{ env.GHCR_IMAGE }}@${{ needs.build-docker.outputs.digest }} \
+            -m nanodns.cli --version
+
+      - name: Functional DNS test
+        run: |
+          cat > /tmp/test.json <<'CONF'
+          {
+            "server": {
+              "host": "0.0.0.0", "port": 53, "upstream": ["8.8.8.8"],
+              "upstream_port": 53, "upstream_timeout": 3,
+              "log_queries": false, "hot_reload": false,
+              "cache_enabled": true, "cache_ttl": 300, "cache_size": 200,
+              "log_level": "WARNING"
+            },
+            "zones": {"verify.lan": {}},
+            "records": [{"name":"ping.verify.lan","type":"A","value":"1.2.3.4","ttl":60}],
+            "rewrites": []
+          }
+          CONF
+
+          docker run -d --name dns-test \
+            --cap-add NET_BIND_SERVICE \
+            -p 5399:53/udp \
+            -v /tmp/test.json:/etc/nanodns.json:ro \
+            ${{ env.GHCR_IMAGE }}@${{ needs.build-docker.outputs.digest }} \
+            start --config /etc/nanodns.json
+
+          sleep 5
+          sudo apt-get install -y -qq dnsutils
+          RESULT=$(dig @127.0.0.1 -p 5399 ping.verify.lan A +short +time=3)
+          docker stop dns-test && docker rm dns-test
+
+          [ "$RESULT" = "1.2.3.4" ] \
+            && echo "✅ DNS resolved: $RESULT" \
+            || (echo "❌ Expected 1.2.3.4 got: $RESULT" && exit 1)
+
+      - name: Verify OCI labels
+        run: |
+          IMAGE="${{ env.GHCR_IMAGE }}@${{ needs.build-docker.outputs.digest }}"
+          MISSING=0
+          for label in \
+            org.opencontainers.image.title \
+            org.opencontainers.image.version \
+            org.opencontainers.image.created \
+            org.opencontainers.image.source \
+            org.opencontainers.image.revision \
+            org.opencontainers.image.licenses; do
+            VALUE=$(docker inspect "$IMAGE" \
+              --format "{{ index .Config.Labels \"$label\" }}")
+            if [ -z "$VALUE" ]; then
+              echo "❌ Missing label: $label"; MISSING=$((MISSING+1))
+            else
+              echo "✅ $label = $VALUE"
+            fi
+          done
+          [ $MISSING -eq 0 ] || exit 1
+
+      - name: Verify non-root user
+        run: |
+          USER=$(docker inspect \
+            ${{ env.GHCR_IMAGE }}@${{ needs.build-docker.outputs.digest }} \
+            --format '{{ .Config.User }}')
+          echo "User: ${USER:-<default>}"
+          [[ "$USER" == "root" || "$USER" == "0" ]] \
+            && echo "⚠️  WARNING: runs as root" \
+            || echo "✅ non-root"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 8️⃣  VULNERABILITY SCAN
+# ══════════════════════════════════════════════════════════════════════════════
+  scan:
+    name: Vulnerability Scan (Trivy)
+    runs-on: ubuntu-latest
+    needs: build-docker
+    if: github.event_name != 'pull_request'
+
+    steps:
+      - uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref:  ${{ env.GHCR_IMAGE }}@${{ needs.build-docker.outputs.digest }}
+          severity:   CRITICAL,HIGH
+          exit-code:  1
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 9️⃣  COSIGN SIGN  (tag only)
+# ══════════════════════════════════════════════════════════════════════════════
+  sign:
+    name: Sign Image (Cosign Keyless)
+    runs-on: ubuntu-latest
+    needs: [build-docker, verify-docker, scan]
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    permissions:
+      id-token: write
+      packages: write
+
+    steps:
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign image
+        run: |
+          cosign sign --yes \
+            ${{ env.GHCR_IMAGE }}@${{ needs.build-docker.outputs.digest }}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 🔟  VERIFY SIGNATURE + PROVENANCE  (tag only)
+# ══════════════════════════════════════════════════════════════════════════════
+  verify-signature:
+    name: Verify Signature & Provenance
+    runs-on: ubuntu-latest
+    needs: sign
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Verify signature
+        run: |
+          cosign verify \
+            --certificate-identity-regexp="https://github.com/${{ github.repository }}/*" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+            ${{ env.GHCR_IMAGE }}@${{ needs.build-docker.outputs.digest }}
+
+      - name: Verify provenance
+        run: |
+          cosign verify-attestation \
+            --type slsaprovenance \
+            --certificate-identity-regexp="https://github.com/${{ github.repository }}/*" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+            ${{ env.GHCR_IMAGE }}@${{ needs.build-docker.outputs.digest }}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1️⃣1️⃣  VERIFY PyPI PACKAGE  (tag only, after publish)
+# ══════════════════════════════════════════════════════════════════════════════
   verify-pypi:
     name: Verify PyPI Package
     runs-on: ubuntu-latest
-    needs: [publish-pypi, build]
+    needs: [publish-pypi, build-pypi]
+    if: startsWith(github.ref, 'refs/tags/v')
 
     permissions:
       contents: read
 
     steps:
-      - name: Wait for propagation
+      - name: Wait for index propagation
         run: sleep 90
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install from public PyPI
+      - name: Install from PyPI
         run: |
           python -m pip install --no-cache-dir \
             --index-url https://pypi.org/simple \
-            "nanodns==${{ needs.build.outputs.version }}"
+            "nanodns==${{ needs.build-pypi.outputs.version }}"
 
       - name: Smoke test
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           INSTALLED=$(nanodns --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
-          [ "$INSTALLED" = "$VERSION" ]
+          [ "$INSTALLED" = "$VERSION" ] \
+            && echo "✅ PyPI $INSTALLED" \
+            || (echo "❌ $INSTALLED != $VERSION" && exit 1)
           nanodns init smoke.json
           nanodns check smoke.json
+          echo "✅ PyPI smoke test passed"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1️⃣2️⃣  RELEASE SUMMARY  (tag only)
+# ══════════════════════════════════════════════════════════════════════════════
+  summary:
+    name: Release Summary
+    runs-on: ubuntu-latest
+    needs: [build-pypi, build-docker, verify-docker, verify-pypi, scan, sign]
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: Write summary
+        run: |
+          echo "## 🚀 NanoDNS ${{ github.ref_name }} Released" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📦 PyPI" >> $GITHUB_STEP_SUMMARY
+          echo "| | |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Package | \`nanodns==${{ needs.build-pypi.outputs.version }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Wheel | \`${{ needs.build-pypi.outputs.whl-name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🐳 Docker" >> $GITHUB_STEP_SUMMARY
+          echo "| | |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Digest | \`${{ needs.build-docker.outputs.digest }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| GHCR | \`${{ env.GHCR_IMAGE }}:${{ needs.build-docker.outputs.version }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### ✅ Checks" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Docker Runtime | ${{ needs.verify-docker.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Vulnerability Scan | ${{ needs.scan.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Cosign Signature | ${{ needs.sign.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| PyPI Verify | ${{ needs.verify-pypi.result }} |" >> $GITHUB_STEP_SUMMARY
