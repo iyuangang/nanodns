@@ -5,11 +5,11 @@
 [![PyPI version](https://img.shields.io/pypi/v/nanodns.svg)](https://pypi.org/project/nanodns/)
 [![Python](https://img.shields.io/pypi/pyversions/nanodns.svg)](https://pypi.org/project/nanodns/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![CI](https://github.com/yourname/nanodns/actions/workflows/release.yml/badge.svg)](https://github.com/yourname/nanodns/actions/workflows/release.yml)
-[![Tests](https://github.com/yourname/nanodns/actions/workflows/test.yml/badge.svg)](https://github.com/yourname/nanodns/actions/workflows/test.yml)
-[![codecov](https://codecov.io/gh/yourname/nanodns/graph/badge.svg?token=CODECOV_TOKEN)](https://codecov.io/gh/yourname/nanodns)
-[![Docker Pulls](https://img.shields.io/docker/pulls/yourname/nanodns)](https://hub.docker.com/r/yourname/nanodns)
-[![GHCR](https://img.shields.io/badge/GHCR-ghcr.io%2Fyourname%2Fnanodns-blue?logo=github)](https://github.com/yourname/nanodns/pkgs/container/nanodns)
+[![CI](https://github.com/iyuangang/nanodns/actions/workflows/release.yml/badge.svg)](https://github.com/iyuangang/nanodns/actions/workflows/release.yml)
+[![Tests](https://github.com/iyuangang/nanodns/actions/workflows/test.yml/badge.svg)](https://github.com/iyuangang/nanodns/actions/workflows/test.yml)
+[![codecov](https://codecov.io/gh/iyuangang/nanodns/graph/badge.svg?token=CODECOV_TOKEN)](https://codecov.io/gh/iyuangang/nanodns)
+[![Docker Pulls](https://img.shields.io/docker/pulls/iyuangang/nanodns)](https://hub.docker.com/r/iyuangang/nanodns)
+[![GHCR](https://img.shields.io/badge/GHCR-ghcr.io%2Fiyuangang%2Fnanodns-blue?logo=github)](https://github.com/iyuangang/nanodns/pkgs/container/nanodns)
 [![OCI](https://img.shields.io/badge/OCI-compliant-blue?logo=opencontainers)](https://specs.opencontainers.org/)
 [![Signed](https://img.shields.io/badge/cosign-keyless-green?logo=sigstore)](https://docs.sigstore.dev/)
 
@@ -43,10 +43,10 @@ pip install nanodns
 
 ```bash
 # GitHub Container Registry (recommended)
-docker pull ghcr.io/yourname/nanodns:latest
+docker pull ghcr.io/iyuangang/nanodns:latest
 
 # Docker Hub
-docker pull yourname/nanodns:latest
+docker pull iyuangang/nanodns:latest
 ```
 
 ---
@@ -83,7 +83,7 @@ docker run -d \
   -p 53:53/udp \
   -v $(pwd)/nanodns.json:/etc/nanodns.json:ro \
   --cap-add NET_BIND_SERVICE \
-  ghcr.io/yourname/nanodns:latest
+  ghcr.io/iyuangang/nanodns:latest
 
 # Run with Docker Compose
 docker compose up -d
@@ -195,8 +195,8 @@ All records support: `ttl` (default `300`), `wildcard` (bool), `comment` (string
 
 | Registry   | Image                              |
 |------------|------------------------------------|
-| GHCR       | `ghcr.io/yourname/nanodns`         |
-| Docker Hub | `yourname/nanodns`                 |
+| GHCR       | `ghcr.io/iyuangang/nanodns`         |
+| Docker Hub | `iyuangang/nanodns`                 |
 
 ### Tags
 
@@ -217,7 +217,7 @@ All records support: `ttl` (default `300`), `wildcard` (bool), `comment` (string
 ```yaml
 services:
   nanodns:
-    image: ghcr.io/yourname/nanodns:latest
+    image: ghcr.io/iyuangang/nanodns:latest
     container_name: nanodns
     restart: unless-stopped
     ports:
@@ -235,14 +235,14 @@ Images are built on [Chainguard distroless Python](https://images.chainguard.dev
 
 ```bash
 # Inspect OCI annotations
-docker inspect ghcr.io/yourname/nanodns:latest \
+docker inspect ghcr.io/iyuangang/nanodns:latest \
   --format '{{json .Config.Labels}}' | python3 -m json.tool
 
 # Verify cosign keyless signature (Sigstore)
 cosign verify \
-  --certificate-identity-regexp="https://github.com/yourname/nanodns/.github/workflows/release.yml@refs/tags/.*" \
+  --certificate-identity-regexp="https://github.com/iyuangang/nanodns/.github/workflows/release.yml@refs/tags/.*" \
   --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
-  ghcr.io/yourname/nanodns:latest
+  ghcr.io/iyuangang/nanodns:latest
 ```
 
 ---
