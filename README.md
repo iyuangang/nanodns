@@ -5,9 +5,13 @@
 [![PyPI version](https://img.shields.io/pypi/v/nanodns.svg)](https://pypi.org/project/nanodns/)
 [![Python](https://img.shields.io/pypi/pyversions/nanodns.svg)](https://pypi.org/project/nanodns/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![CI](https://github.com/iyuangang/nanodns/actions/workflows/release.yml/badge.svg)](https://github.com/iyuangang/nanodns/actions/workflows/release.yml)
-[![Docker Pulls](https://img.shields.io/docker/pulls/iyuangang/nanodns)](https://hub.docker.com/r/iyuangang/nanodns)
+[![CI](https://github.com/yourname/nanodns/actions/workflows/release.yml/badge.svg)](https://github.com/yourname/nanodns/actions/workflows/release.yml)
+[![Tests](https://github.com/yourname/nanodns/actions/workflows/test.yml/badge.svg)](https://github.com/yourname/nanodns/actions/workflows/test.yml)
+[![codecov](https://codecov.io/gh/yourname/nanodns/graph/badge.svg?token=CODECOV_TOKEN)](https://codecov.io/gh/yourname/nanodns)
+[![Docker Pulls](https://img.shields.io/docker/pulls/yourname/nanodns)](https://hub.docker.com/r/yourname/nanodns)
+[![GHCR](https://img.shields.io/badge/GHCR-ghcr.io%2Fyourname%2Fnanodns-blue?logo=github)](https://github.com/yourname/nanodns/pkgs/container/nanodns)
 [![OCI](https://img.shields.io/badge/OCI-compliant-blue?logo=opencontainers)](https://specs.opencontainers.org/)
+[![Signed](https://img.shields.io/badge/cosign-keyless-green?logo=sigstore)](https://docs.sigstore.dev/)
 
 ---
 
@@ -38,11 +42,11 @@ pip install nanodns
 ### Docker
 
 ```bash
-# Docker Hub
-docker pull iyuangang/nanodns:latest
+# GitHub Container Registry (recommended)
+docker pull ghcr.io/yourname/nanodns:latest
 
-# GitHub Container Registry
-docker pull ghcr.io/iyuangang/nanodns:latest
+# Docker Hub
+docker pull yourname/nanodns:latest
 ```
 
 ---
@@ -60,7 +64,7 @@ nanodns init
 # 3. Validate config
 nanodns check nanodns.json
 
-# 4. Start (high port — no admin rights needed)
+# 4. Start on a high port (no admin rights needed)
 nanodns start --config nanodns.json --port 5353
 
 # 5. Start on port 53 (requires root / Administrator)
@@ -77,9 +81,9 @@ nanodns init nanodns.json
 docker run -d \
   --name nanodns \
   -p 53:53/udp \
-  -v $(pwd)/nanodns.json:/etc/nanodns/nanodns.json:ro \
+  -v $(pwd)/nanodns.json:/etc/nanodns.json:ro \
   --cap-add NET_BIND_SERVICE \
-  iyuangang/nanodns:latest
+  ghcr.io/yourname/nanodns:latest
 
 # Run with Docker Compose
 docker compose up -d
@@ -91,10 +95,10 @@ docker compose up -d
 # Linux / macOS
 dig @127.0.0.1 -p 5353 web.internal.lan A
 
-# Windows
+# Windows (cmd)
 nslookup web.internal.lan 127.0.0.1
 
-# PowerShell
+# Windows (PowerShell)
 Resolve-DnsName -Name web.internal.lan -Server 127.0.0.1 -Type A
 ```
 
@@ -189,56 +193,56 @@ All records support: `ttl` (default `300`), `wildcard` (bool), `comment` (string
 
 ### Images
 
-| Registry | Image |
-|----------|-------|
-| Docker Hub | `iyuangang/nanodns` |
-| GHCR | `ghcr.io/iyuangang/nanodns` |
+| Registry   | Image                              |
+|------------|------------------------------------|
+| GHCR       | `ghcr.io/yourname/nanodns`         |
+| Docker Hub | `yourname/nanodns`                 |
 
 ### Tags
 
-| Tag | Description |
-|-----|-------------|
-| `latest` | Latest stable release |
-| `1.2.3` | Exact version |
-| `1.2` | Minor version |
-| `1` | Major version |
-| `sha-a1b2c3` | Specific commit |
+| Tag         | Description               |
+|-------------|---------------------------|
+| `latest`    | Latest stable release     |
+| `1.2.3`     | Exact version             |
+| `1.2`       | Minor version             |
+| `1`         | Major version             |
+| `sha-a1b2c3`| Specific commit (main)    |
 
 ### Platforms
 
-`linux/amd64` · `linux/arm64` (Raspberry Pi, Apple Silicon)
+`linux/amd64` · `linux/arm64` (Raspberry Pi 4+, Apple Silicon via emulation)
 
 ### docker-compose.yml
 
 ```yaml
 services:
   nanodns:
-    image: iyuangang/nanodns:latest
+    image: ghcr.io/yourname/nanodns:latest
     container_name: nanodns
     restart: unless-stopped
     ports:
       - "53:53/udp"
     volumes:
-      - ./nanodns.json:/etc/nanodns/nanodns.json:ro
+      - ./nanodns.json:/etc/nanodns.json:ro
     cap_add:
       - NET_BIND_SERVICE
     read_only: true
 ```
 
-### OCI Compliance
+### OCI Compliance & Supply Chain Security
 
-Images follow the [OCI Image Spec](https://specs.opencontainers.org/image-spec/) with standard annotations:
+Images are built on [Chainguard distroless Python](https://images.chainguard.dev/directory/image/python/overview) and follow the [OCI Image Spec](https://specs.opencontainers.org/image-spec/) with standard annotations.
 
 ```bash
 # Inspect OCI annotations
-docker inspect iyuangang/nanodns:latest \
+docker inspect ghcr.io/yourname/nanodns:latest \
   --format '{{json .Config.Labels}}' | python3 -m json.tool
 
-# Verify cosign signature (keyless / Sigstore)
+# Verify cosign keyless signature (Sigstore)
 cosign verify \
-  --certificate-identity-regexp="https://github.com/iyuangang/nanodns/*" \
+  --certificate-identity-regexp="https://github.com/yourname/nanodns/.github/workflows/release.yml@refs/tags/.*" \
   --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
-  iyuangang/nanodns:latest
+  ghcr.io/yourname/nanodns:latest
 ```
 
 ---
@@ -278,7 +282,7 @@ nssm start NanoDNS
 ```bash
 nanodns start --config nanodns.json --port 5353
 
-# Redirect port 53 → 5353 with iptables
+# Redirect port 53 → 5353 with iptables (Linux)
 sudo iptables -t nat -A PREROUTING -p udp --dport 53 -j REDIRECT --to-port 5353
 ```
 
@@ -286,10 +290,22 @@ sudo iptables -t nat -A PREROUTING -p udp --dport 53 -j REDIRECT --to-port 5353
 
 ## CI / CD
 
+### Commit Convention
+
+Commit prefix determines what runs in CI:
+
+| Prefix | Tests | Docker build | PyPI release |
+|--------|-------|--------------|--------------|
+| `feat` `fix` `perf` `refactor` | ✅ | ✅ on main | 🏷️ on tag |
+| `test` `ci` `build` | ✅ | ⏭️ skip | ⏭️ skip |
+| `docs` `style` `chore` | ⏭️ skip | ⏭️ skip | ⏭️ skip |
+
+### Workflows
+
 | Workflow | Trigger | Description |
 |----------|---------|-------------|
-| `release.yml` | `v*` tag | Run tests → build wheel → GitHub Release → publish PyPI |
-| `docker.yml` | `v*` tag / `main` | Build multi-platform OCI image → push GHCR + Docker Hub → cosign sign |
+| `test.yml` | every push / PR | Unit + integration tests across 3 OS × 3 Python versions; uploads coverage to Codecov |
+| `release.yml` | `v*` tag / `main` | Full pipeline: test → build → summary → GitHub Release → PyPI → Docker |
 
 ### Release a new version
 
@@ -302,7 +318,7 @@ git tag v0.2.0
 git push origin main --tags
 ```
 
-Both PyPI and Docker Hub are published automatically.
+PyPI and Docker Hub are published automatically on tag push.
 
 ---
 

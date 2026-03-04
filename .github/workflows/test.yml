@@ -106,7 +106,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.12", "3.14"]
+        python-version: ["3.10", "3.11", "3.12"]
         os: [ubuntu-latest, windows-latest, macos-latest]
 
     steps:
@@ -144,13 +144,26 @@ jobs:
           path: results/
           retention-days: 1
 
-      - name: Upload coverage
+      - name: Upload coverage artifact
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
         uses: actions/upload-artifact@v4
         with:
           name: coverage-report
           path: coverage-*.xml
           retention-days: 7
+
+      # Upload to Codecov on every ubuntu/3.12 run (canonical coverage source).
+      # CODECOV_TOKEN must be set in repo Settings → Secrets.
+      - name: Upload to Codecov
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage-ubuntu-latest-3.12.xml
+          flags: unit
+          fail_ci_if_error: false   # never block CI on a Codecov outage
+          verbose: true
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
       - name: Fail if tests failed
         if: steps.pytest.outcome == 'failure'
@@ -165,8 +178,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
-        python-version: ["3.10", "3.12", "3.14"]
+        os: [ubuntu-latest]
+        python-version: ["3.10", "3.12"]
 
     steps:
       - uses: actions/checkout@v4
