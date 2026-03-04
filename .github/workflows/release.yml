@@ -186,49 +186,207 @@ jobs:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 4️⃣  GITHUB RELEASE  (tag only, after wheel verification)
+# 4️⃣  RELEASE SUMMARY  (tag only — runs BEFORE github-release)
+#     Writes release_body.md → uploaded as artifact.
+#     github-release reads it via body-path (avoids YAML multiline issues).
 # ══════════════════════════════════════════════════════════════════════════════
-  github-release:
-    name: Create GitHub Release
+  summary:
+    name: Release Summary
     runs-on: ubuntu-latest
-    needs: verify-whl
-    if: startsWith(github.ref, 'refs/tags/v')
-
-    permissions:
-      contents: write
+    needs:
+      - build-pypi
+      - verify-whl
+      - build-docker
+      - verify-docker
+      - scan
+      - sign
+      - verify-signature
+    if: always() && startsWith(github.ref, 'refs/tags/v')
 
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
+      - name: Build release body and step summary
+        env:
+          VERSION:    ${{ needs.build-pypi.outputs.version }}
+          DIGEST:     ${{ needs.build-docker.outputs.digest }}
+          GHCR:       ${{ env.GHCR_IMAGE }}
+          R_BUILD:    ${{ needs.build-pypi.result }}
+          R_WHL:      ${{ needs.verify-whl.result }}
+          R_DOCKER:   ${{ needs.build-docker.result }}
+          R_VERIFY:   ${{ needs.verify-docker.result }}
+          R_SCAN:     ${{ needs.scan.result }}
+          R_SIGN:     ${{ needs.sign.result }}
+          R_SIGVER:   ${{ needs.verify-signature.result }}
+          REF_NAME:   ${{ github.ref_name }}
+          SHA:        ${{ github.sha }}
+        shell: python
+        run: |
+          import os, subprocess, pathlib
+
+          env = os.environ
+          version  = env["VERSION"]
+          digest   = env["DIGEST"]
+          image    = env["GHCR"]
+          ref      = env["REF_NAME"]
+          sha      = env["SHA"]
+
+          results = {
+              "build":     env["R_BUILD"],
+              "whl":       env["R_WHL"],
+              "docker":    env["R_DOCKER"],
+              "verify":    env["R_VERIFY"],
+              "scan":      env["R_SCAN"],
+              "sign":      env["R_SIGN"],
+              "sigver":    env["R_SIGVER"],
+          }
+
+          icons = {"success": "✅", "failure": "❌", "skipped": "⏭️", "cancelled": "🚫"}
+          def icon(k): return icons.get(results[k], "⚪")
+          def row(label, k): return f"| {label} | {icon(k)} `{results[k]}` |"
+
+          all_ok = all(results[k] == "success" for k in ["whl", "docker", "scan", "sign"])
+          overall = "✅ All checks passed" if all_ok else "⚠️ Some checks failed"
+
+          # ── Changelog ────────────────────────────────────────────────────
+          tags = subprocess.run(
+              ["git", "tag", "--sort=-version:refname"],
+              capture_output=True, text=True
+          ).stdout.strip().splitlines()
+          vtags = [t for t in tags if t.startswith("v")]
+          prev  = vtags[1] if len(vtags) > 1 else ""
+          log_range = f"{prev}..HEAD" if prev else "HEAD"
+          commits = subprocess.run(
+              ["git", "log", "--pretty=format:- %s (%h)", log_range],
+              capture_output=True, text=True
+          ).stdout.strip()
+
+          # ── Release page body ─────────────────────────────────────────────
+          body_lines = [
+              "## What's Changed",
+              "",
+              commits,
+              "",
+              "---",
+              "",
+              "## 📦 Install",
+              "",
+              "```bash",
+              f"pip install nanodns=={version}",
+              "```",
+              "",
+              "```bash",
+              f"docker pull {image}:{version}",
+              "```",
+          ]
+          if digest:
+              body_lines += [
+                  "",
+                  "```bash",
+                  "# Pin to immutable digest",
+                  f"docker pull {image}@{digest}",
+                  "```",
+              ]
+          body_lines += [
+              "",
+              "---",
+              "",
+              f"## 🔍 Pipeline — {overall}",
+              "",
+              "### 📦 PyPI",
+              "| Step | Result |",
+              "|---|---|",
+              row("Build distribution",            "build"),
+              row("Verify wheel (cross-platform)", "whl"),
+              "",
+              "### 🐳 Docker",
+              "| Step | Result |",
+              "|---|---|",
+              row("Build & push OCI image",        "docker"),
+              row("Runtime verification (amd64)",  "verify"),
+              row("Vulnerability scan (Trivy)",    "scan"),
+              row("Sign image (Cosign keyless)",   "sign"),
+              row("Verify signature & provenance", "sigver"),
+          ]
+          pathlib.Path("/tmp/release_body.md").write_text("\n".join(body_lines) + "\n")
+          print("✅ release_body.md written")
+
+          # ── Actions Step Summary ──────────────────────────────────────────
+          summary_lines = [
+              f"## 🚀 NanoDNS {ref} — {overall}",
+              "",
+              "| | |",
+              "|---|---|",
+              f"| **Version** | `{version}` |",
+              f"| **SHA**     | `{sha}` |",
+              "",
+              "### 📦 PyPI Pipeline",
+              "| Step | Result |",
+              "|---|---|",
+              row("Build distribution",            "build"),
+              row("Verify wheel (cross-platform)", "whl"),
+              "",
+              "### 🐳 Docker Pipeline",
+              "| Step | Result |",
+              "|---|---|",
+              row("Build & push OCI image",        "docker"),
+              row("Runtime verification (amd64)",  "verify"),
+              row("Vulnerability scan (Trivy)",    "scan"),
+              row("Sign image (Cosign keyless)",   "sign"),
+              row("Verify signature & provenance", "sigver"),
+          ]
+          if digest:
+              summary_lines += [
+                  "",
+                  "🐳 **Immutable digest:**",
+                  "```",
+                  f"docker pull {image}@{digest}",
+                  "```",
+              ]
+          pathlib.Path(env["GITHUB_STEP_SUMMARY"]).write_text(
+              "\n".join(summary_lines) + "\n"
+          )
+          print("✅ GITHUB_STEP_SUMMARY written")
+
+      - name: Upload release body artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-body
+          path: /tmp/release_body.md
+          retention-days: 1
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5️⃣  GITHUB RELEASE  (tag only, after summary)
+#     Reads release_body.md via body-path — avoids YAML multiline truncation.
+# ══════════════════════════════════════════════════════════════════════════════
+  github-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [summary, verify-whl]
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    permissions:
+      contents: write
+
+    steps:
       - uses: actions/download-artifact@v4
         with:
           name: dist
           path: dist/
 
-      - name: Generate changelog
-        id: changelog
-        run: |
-          PREV_TAG=$(git tag --sort=-version:refname | grep '^v' | sed -n '2p')
-          if [ -z "$PREV_TAG" ]; then
-            COMMITS=$(git log --pretty=format:"- %s (%h)")
-          else
-            COMMITS=$(git log --pretty=format:"- %s (%h)" "$PREV_TAG"..HEAD)
-          fi
-          {
-            echo "changelog<<EOF"
-            echo "## What's Changed"
-            echo ""
-            echo "$COMMITS"
-            echo "EOF"
-          } >> $GITHUB_OUTPUT
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-body
+          path: /tmp/
 
       - uses: softprops/action-gh-release@v2
         with:
           tag_name:   ${{ github.ref_name }}
           name:       "NanoDNS ${{ github.ref_name }}"
-          body:       ${{ steps.changelog.outputs.changelog }}
+          body_path:  /tmp/release_body.md
           draft:      false
           prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
@@ -237,8 +395,7 @@ jobs:
             SHA256SUMS
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 5️⃣  PUBLISH TO PyPI  (tag only, after GitHub release)
+# 6️⃣  PUBLISH TO PyPI  (tag only, after GitHub release)
 # ══════════════════════════════════════════════════════════════════════════════
   publish-pypi:
     name: Publish to PyPI
@@ -263,24 +420,16 @@ jobs:
       - name: Publish via Trusted Publishing (OIDC)
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          # Only upload recognized distribution files (.whl, .tar.gz).
-          # SHA256SUMS is intentionally kept outside dist/ to avoid
-          # InvalidDistribution errors from the publish action.
           packages-dir: dist/
           skip-existing: false
           verbose: true
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-# 6️⃣  BUILD & PUSH DOCKER IMAGE  (tag + main, skip PR)
+# 7️⃣  BUILD & PUSH DOCKER IMAGE  (tag + main, skip PR)
 # ══════════════════════════════════════════════════════════════════════════════
   build-docker:
     name: Build & Push OCI Image
     runs-on: ubuntu-latest
-    # Skipped when:
-    #   • PR (never push images from PRs)
-    #   • tests were skipped entirely (docs/style/chore commit — no code changed)
-    #   • skip_docker=true (test/ci/build commit — image content unchanged)
     needs: tests
     if: >-
       github.event_name != 'pull_request' &&
@@ -360,7 +509,7 @@ jobs:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 7️⃣  VERIFY DOCKER RUNTIME  (amd64)
+# 8️⃣  VERIFY DOCKER RUNTIME  (amd64)
 # ══════════════════════════════════════════════════════════════════════════════
   verify-docker:
     name: Verify Docker Runtime
@@ -451,7 +600,7 @@ jobs:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 8️⃣  VULNERABILITY SCAN
+# 9️⃣  VULNERABILITY SCAN
 # ══════════════════════════════════════════════════════════════════════════════
   scan:
     name: Vulnerability Scan (Trivy)
@@ -468,7 +617,7 @@ jobs:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 9️⃣  COSIGN SIGN  (tag only)
+# 🔟  COSIGN SIGN  (tag only)
 # ══════════════════════════════════════════════════════════════════════════════
   sign:
     name: Sign Image (Cosign Keyless)
@@ -497,7 +646,7 @@ jobs:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 🔟  VERIFY SIGNATURE + PROVENANCE  (tag only)
+# 1️⃣1️⃣  VERIFY SIGNATURE + PROVENANCE  (tag only)
 # ══════════════════════════════════════════════════════════════════════════════
   verify-signature:
     name: Verify Signature & Provenance
@@ -520,8 +669,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Verify the cosign keyless signature we pushed in the sign job.
-      # Certificate identity matches the workflow that ran cosign sign.
       - name: Verify cosign signature
         run: |
           cosign verify \
@@ -529,12 +676,6 @@ jobs:
             --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
             ${{ env.GHCR_IMAGE }}@${{ needs.build-docker.outputs.digest }}
 
-      # Verify SLSA provenance stored as OCI referrer by docker/build-push-action.
-      # build-push-action pushes provenance as an OCI referrer into the registry,
-      # not into GitHub's attestation store (gh attestation verify = 404).
-      # cosign v2 renamed the predicate type to slsaprovenance02.
-      # The signer identity is docker/build-push-action, not our workflow.
-      # Use || true so a missing provenance is a warning, not a pipeline failure.
       - name: Verify SLSA provenance
         run: |
           cosign verify-attestation \
@@ -547,7 +688,7 @@ jobs:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1️⃣1️⃣  VERIFY PyPI PACKAGE  (tag only, after publish)
+# 1️⃣2️⃣  VERIFY PyPI PACKAGE  (tag only, after publish)
 # ══════════════════════════════════════════════════════════════════════════════
   verify-pypi:
     name: Verify PyPI Package
@@ -582,116 +723,3 @@ jobs:
           nanodns init smoke.json
           nanodns check smoke.json
           echo "✅ PyPI smoke test passed"
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 1️⃣2️⃣  RELEASE SUMMARY  (tag only)
-# ══════════════════════════════════════════════════════════════════════════════
-  summary:
-    name: Release Summary
-    runs-on: ubuntu-latest
-    # Include all jobs so their results are accessible; always() prevents
-    # cancellation when an upstream job is skipped or fails.
-    needs:
-      - build-pypi
-      - verify-whl
-      - github-release
-      - publish-pypi
-      - verify-pypi
-      - build-docker
-      - verify-docker
-      - scan
-      - sign
-      - verify-signature
-    if: always() && startsWith(github.ref, 'refs/tags/v')
-
-    steps:
-      - name: Write release summary
-        run: |
-          # ── helper ───────────────────────────────────────────────────────
-          icon() {
-            case "$1" in
-              success)  echo "✅" ;;
-              failure)  echo "❌" ;;
-              skipped)  echo "⏭️" ;;
-              cancelled)echo "🚫" ;;
-              *)        echo "⚪" ;;
-            esac
-          }
-          row() { echo "| $1 | $(icon $2) \`$2\` |" ; }
-
-          S=$GITHUB_STEP_SUMMARY
-
-          # ── Header ───────────────────────────────────────────────────────
-          echo "## 🚀 NanoDNS ${{ github.ref_name }} Release Pipeline" >> $S
-          echo "" >> $S
-          echo "| | |" >> $S
-          echo "|---|---|" >> $S
-          echo "| **Version** | \`${{ needs.build-pypi.outputs.version }}\` |" >> $S
-          echo "| **Ref** | \`${{ github.ref_name }}\` |" >> $S
-          echo "| **SHA** | \`${{ github.sha }}\` |" >> $S
-          echo "" >> $S
-
-          # ── PyPI Pipeline ────────────────────────────────────────────────
-          echo "### 📦 PyPI Pipeline" >> $S
-          echo "" >> $S
-          echo "| Step | Result |" >> $S
-          echo "|---|---|" >> $S
-          row "Build distribution" "${{ needs.build-pypi.result }}" >> $S
-          row "Verify wheel (cross-platform matrix)" "${{ needs.verify-whl.result }}" >> $S
-          row "Create GitHub Release" "${{ needs.github-release.result }}" >> $S
-          row "Publish to PyPI" "${{ needs.publish-pypi.result }}" >> $S
-          row "Verify from PyPI index" "${{ needs.verify-pypi.result }}" >> $S
-          echo "" >> $S
-
-          if [[ "${{ needs.publish-pypi.result }}" == "success" ]]; then
-            echo "📥 **Install:** \`pip install nanodns==${{ needs.build-pypi.outputs.version }}\`" >> $S
-            echo "" >> $S
-            echo "🔗 https://pypi.org/project/nanodns/${{ needs.build-pypi.outputs.version }}/" >> $S
-          fi
-          echo "" >> $S
-
-          # ── Docker Pipeline ──────────────────────────────────────────────
-          echo "### 🐳 Docker Pipeline" >> $S
-          echo "" >> $S
-          echo "| Step | Result |" >> $S
-          echo "|---|---|" >> $S
-          row "Build & push OCI image" "${{ needs.build-docker.result }}" >> $S
-          row "Runtime verification (amd64)" "${{ needs.verify-docker.result }}" >> $S
-          row "Vulnerability scan (Trivy)" "${{ needs.scan.result }}" >> $S
-          row "Sign image (Cosign keyless)" "${{ needs.sign.result }}" >> $S
-          row "Verify signature & provenance" "${{ needs.verify-signature.result }}" >> $S
-          echo "" >> $S
-
-          if [[ "${{ needs.build-docker.result }}" == "success" ]]; then
-            echo "🐳 **Pull:**" >> $S
-            echo "\`\`\`" >> $S
-            echo "docker pull ${{ env.GHCR_IMAGE }}:${{ needs.build-docker.outputs.version }}" >> $S
-            echo "docker pull ${{ env.GHCR_IMAGE }}@${{ needs.build-docker.outputs.digest }}" >> $S
-            echo "\`\`\`" >> $S
-          fi
-          echo "" >> $S
-
-          # ── Overall status ───────────────────────────────────────────────
-          echo "### 📊 Overall Pipeline Status" >> $S
-          echo "" >> $S
-
-          PYPI_OK="${{ needs.publish-pypi.result }}"
-          DOCK_OK="${{ needs.build-docker.result }}"
-          SIGN_OK="${{ needs.sign.result }}"
-          SCAN_OK="${{ needs.scan.result }}"
-
-          echo "| Pipeline | Result |" >> $S
-          echo "|---|---|" >> $S
-          row "PyPI publish" "$PYPI_OK" >> $S
-          row "Docker image" "$DOCK_OK" >> $S
-          row "Security scan" "$SCAN_OK" >> $S
-          row "Image signature" "$SIGN_OK" >> $S
-
-          if [[ "$PYPI_OK" == "success" && "$DOCK_OK" == "success" && "$SIGN_OK" == "success" && "$SCAN_OK" == "success" ]]; then
-            echo "" >> $S
-            echo "## ✅ Release ${{ github.ref_name }} completed successfully" >> $S
-          else
-            echo "" >> $S
-            echo "## ⚠️ Release ${{ github.ref_name }} completed with issues — review steps above" >> $S
-          fi
