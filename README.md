@@ -6,7 +6,6 @@
 [![Python](https://img.shields.io/pypi/pyversions/nanodns.svg)](https://pypi.org/project/nanodns/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![CI](https://github.com/iyuangang/nanodns/actions/workflows/release.yml/badge.svg)](https://github.com/iyuangang/nanodns/actions/workflows/release.yml)
-[![Tests](https://github.com/iyuangang/nanodns/actions/workflows/test.yml/badge.svg)](https://github.com/iyuangang/nanodns/actions/workflows/test.yml)
 [![codecov](https://codecov.io/gh/iyuangang/nanodns/graph/badge.svg?token=CODECOV_TOKEN)](https://codecov.io/gh/iyuangang/nanodns)
 [![Docker Pulls](https://img.shields.io/docker/pulls/iyuangang/nanodns)](https://hub.docker.com/r/iyuangang/nanodns)
 [![GHCR](https://img.shields.io/badge/GHCR-ghcr.io%2Fiyuangang%2Fnanodns-blue?logo=github)](https://github.com/iyuangang/nanodns/pkgs/container/nanodns)
