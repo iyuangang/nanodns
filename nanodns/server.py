@@ -17,8 +17,8 @@ logger = logging.getLogger(__name__)
 
 
 class DNSServerProtocol(asyncio.DatagramProtocol):
-    def __init__(self, handler: DNSHandler):
-        self.handler   = handler
+    def __init__(self, server: "DNSServer"):
+        self.server    = server          # always points at the live DNSServer
         self.transport: Optional[asyncio.DatagramTransport] = None
 
     def connection_made(self, transport: asyncio.DatagramTransport):
@@ -26,7 +26,9 @@ class DNSServerProtocol(asyncio.DatagramProtocol):
 
     def datagram_received(self, data: bytes, addr: tuple):
         try:
-            response = self.handler.handle(data)
+            # Read handler from the server each time so that apply_config()
+            # swaps take effect immediately without restarting the transport.
+            response = self.server.handler.handle(data)
             if response:
                 self.transport.sendto(response, addr)
         except Exception as exc:
@@ -141,7 +143,7 @@ class DNSServer:
 
         loop = asyncio.get_running_loop()
         transport, _ = await loop.create_datagram_endpoint(
-            lambda: DNSServerProtocol(self.handler),
+            lambda: DNSServerProtocol(self),
             local_addr=(host, port),
         )
         self._transport = transport

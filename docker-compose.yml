@@ -1,22 +1,164 @@
+# NanoDNS — 3-node HA cluster
+#
+# All three nodes bind-mount the same nanodns.json.
+# Each node's "peers" list is injected via NANODNS_PEERS at runtime
+# so the config file itself stays node-agnostic.
+#
+# Quick start
+# ───────────
+#   docker compose up -d
+#   curl -s http://localhost:9053/cluster | jq .
+#
+# Updating config (zero-downtime)
+# ────────────────────────────────
+#   Edit nanodns.json, then on ONE node:
+#     curl -s -X POST http://localhost:9053/reload | jq .
+#   That node bumps config_version, applies in-process, and pushes
+#   the new config to ns2 and ns3 automatically.
+#
+#   Alternatively: hot_reload=true — each node notices the file change
+#   within 5 s and triggers the same push cascade.
+#
+# Failover test
+# ─────────────
+#   docker stop nanodns-ns1
+#   dig @127.0.0.1 -p 5302 web.internal.lan A +short   # ns2 still answers
+#   docker start nanodns-ns1    # ns1 auto catch-up within 30 s
+
 services:
-  nanodns:
-    image: iyuangang/nanodns:latest
-    container_name: nanodns
+
+  ns1:
+    image: ghcr.io/iyuangang/nanodns:latest
+    container_name: nanodns-ns1
     restart: unless-stopped
+    cap_add: [NET_BIND_SERVICE]
     ports:
-      - "53:53/udp"
+      - "5301:53/udp"     # DNS (exposed for testing; in prod use HAProxy)
+      - "9053:9053/tcp"   # Management HTTP
     volumes:
-      - ./nanodns.json:/etc/nanodns/nanodns.json:ro
-    # Grant permission to bind port 53 without running as root
-    cap_add:
-      - NET_BIND_SERVICE
-    # Read-only root filesystem (security hardening)
-    read_only: true
-    tmpfs:
-      - /tmp
-    # Resource limits
-    deploy:
-      resources:
-        limits:
-          cpus: "0.5"
-          memory: 64M
+      - ./nanodns.json:/etc/nanodns/nanodns.json
+    environment:
+      NANODNS_PEERS: "ns2:9053,ns3:9053"
+    entrypoint:
+      - sh
+      - -c
+      - |
+        python3 -c "
+        import json, os, pathlib
+        p = pathlib.Path('/etc/nanodns/nanodns.json')
+        d = json.loads(p.read_text())
+        peers = [x.strip() for x in os.environ.get('NANODNS_PEERS','').split(',') if x.strip()]
+        if peers:
+            d.setdefault('server', {})['peers'] = peers
+        p.write_text(json.dumps(d, indent=2))
+        "
+        exec nanodns start --config /etc/nanodns/nanodns.json
+    networks:
+      nanodns:
+        ipv4_address: 172.28.0.11
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9053/ready',timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  ns2:
+    image: ghcr.io/iyuangang/nanodns:latest
+    container_name: nanodns-ns2
+    restart: unless-stopped
+    cap_add: [NET_BIND_SERVICE]
+    ports:
+      - "5302:53/udp"
+      - "9054:9053/tcp"
+    volumes:
+      - ./nanodns.json:/etc/nanodns/nanodns.json
+    environment:
+      NANODNS_PEERS: "ns1:9053,ns3:9053"
+    entrypoint:
+      - sh
+      - -c
+      - |
+        python3 -c "
+        import json, os, pathlib
+        p = pathlib.Path('/etc/nanodns/nanodns.json')
+        d = json.loads(p.read_text())
+        peers = [x.strip() for x in os.environ.get('NANODNS_PEERS','').split(',') if x.strip()]
+        if peers:
+            d.setdefault('server', {})['peers'] = peers
+        p.write_text(json.dumps(d, indent=2))
+        "
+        exec nanodns start --config /etc/nanodns/nanodns.json
+    networks:
+      nanodns:
+        ipv4_address: 172.28.0.12
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9053/ready',timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  ns3:
+    image: ghcr.io/iyuangang/nanodns:latest
+    container_name: nanodns-ns3
+    restart: unless-stopped
+    cap_add: [NET_BIND_SERVICE]
+    ports:
+      - "5303:53/udp"
+      - "9055:9053/tcp"
+    volumes:
+      - ./nanodns.json:/etc/nanodns/nanodns.json
+    environment:
+      NANODNS_PEERS: "ns1:9053,ns2:9053"
+    entrypoint:
+      - sh
+      - -c
+      - |
+        python3 -c "
+        import json, os, pathlib
+        p = pathlib.Path('/etc/nanodns/nanodns.json')
+        d = json.loads(p.read_text())
+        peers = [x.strip() for x in os.environ.get('NANODNS_PEERS','').split(',') if x.strip()]
+        if peers:
+            d.setdefault('server', {})['peers'] = peers
+        p.write_text(json.dumps(d, indent=2))
+        "
+        exec nanodns start --config /etc/nanodns/nanodns.json
+    networks:
+      nanodns:
+        ipv4_address: 172.28.0.13
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9053/ready',timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  # ── Optional: HAProxy for single :53 UDP entry-point ──────────────────────
+  # Uncomment this block to add a load-balancer in front of the three nodes.
+  # haproxy:
+  #   image: haproxy:2.9-alpine
+  #   container_name: nanodns-lb
+  #   restart: unless-stopped
+  #   ports:
+  #     - "53:53/udp"
+  #     - "8404:8404/tcp"   # stats page → http://localhost:8404/stats
+  #   volumes:
+  #     - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+  #   depends_on:
+  #     ns1: { condition: service_healthy }
+  #     ns2: { condition: service_healthy }
+  #     ns3: { condition: service_healthy }
+  #   networks:
+  #     nanodns: {}
+
+networks:
+  nanodns:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
