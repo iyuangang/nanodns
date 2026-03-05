@@ -69,7 +69,6 @@ class DNSServer:
 
         except Exception as exc:
             logger.error("Failed to reload config: %s", exc)
-            raise
 
     def apply_config(self, new_cfg: Config) -> None:
         """Swap in a new Config object and clear the cache.

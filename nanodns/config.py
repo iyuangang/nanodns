@@ -299,7 +299,7 @@ def bump_version(raw: bytes) -> bytes:
     return json.dumps(data, indent=2, ensure_ascii=False).encode()
 
 
-def _parse_config(data: dict, path: Optional[Path], raw: bytes) -> Config:
+def _parse_config(data: dict, path: Optional[Path], raw: bytes = b"") -> Config:
     sd = data.get("server", {})
     server = ServerConfig(
         host=sd.get("host", "0.0.0.0"),
