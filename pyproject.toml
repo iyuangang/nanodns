@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nanodns"
-version = "0.3.3"
+version = "1.0.0"
 description = "A lightweight, JSON-configurable DNS server for internal networks"
 readme = "README.md"
 license = "MIT"
 authors = [{ name = "NanoDNS Contributors" }]
 keywords = ["dns", "server", "networking", "internal", "intranet"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Environment :: Console",
     "Intended Audience :: System Administrators",
     "Intended Audience :: Developers",
