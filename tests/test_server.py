@@ -1,8 +1,8 @@
 """
-server.py 和 cli.py 的覆盖率测试。
-兼容 Python 3.10-3.14，Windows + Unix。
-不使用 asyncio.coroutine（3.11+ 已删除）。
-patch 路径全部经过验证。
+Unit tests for nanodns.server and nanodns.cli
+Covers: DNSServerProtocol (including apply_config regression),
+        DNSServer (sync and async), setup_logging, run_server,
+        CLI init / check / start.
 """
 
 import asyncio
@@ -10,10 +10,8 @@ import io
 import json
 import os
 import sys
-import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -23,18 +21,19 @@ from nanodns.cache import DNSCache
 from nanodns.handler import DNSHandler
 from nanodns.protocol import (
     DNSMessage, DNSQuestion,
-    QType, QClass, build_message,
+    QType, QClass,
+    encode_a, parse_message, build_message,
 )
 from nanodns.server import DNSServerProtocol, DNSServer, setup_logging, run_server
 from nanodns.cli import main
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 通用 helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# Shared helpers
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _sdict(**kw):
-    """最小化 server 配置字典。"""
+    """Minimal server config dict."""
     d = {
         "host": "127.0.0.1", "port": 0,
         "upstream": [], "upstream_port": 53, "upstream_timeout": 2,
@@ -52,30 +51,29 @@ def _cfg(**kw):
     )
 
 
-def _cfg_with_record():
+def _cfg_ip(ip: str, name: str = "ping.t.lan"):
+    """Config with a single A record pointing to *ip*."""
     return _parse_config({
         "server": _sdict(),
         "zones": {"t.lan": {}},
-        "records": [{"name": "ping.t.lan", "type": "A", "value": "1.2.3.4", "ttl": 60}],
+        "records": [{"name": name, "type": "A", "value": ip, "ttl": 60}],
         "rewrites": [],
     }, None)
 
 
-def _write_cfg(path, **kw):
-    """把配置写到文件，返回路径字符串。"""
+def _write_cfg(path, **kw) -> str:
     data = {"server": _sdict(**kw), "zones": {}, "records": [], "rewrites": []}
     Path(path).write_text(json.dumps(data))
     return str(path)
 
 
-def _query(name="ping.t.lan"):
+def _query(name: str = "ping.t.lan") -> bytes:
     msg = DNSMessage(msg_id=1, flags=0x0100)
     msg.questions.append(DNSQuestion(name, QType.A, QClass.IN))
     return build_message(msg)
 
 
 def _run_cli(args):
-    """执行 CLI，返回 (exit_code, stdout, stderr)。"""
     out, err = io.StringIO(), io.StringIO()
     code = 0
     with patch("sys.argv", ["nanodns"] + args), \
@@ -88,51 +86,107 @@ def _run_cli(args):
     return code, out.getvalue(), err.getvalue()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
 # DNSServerProtocol
-# ──────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class TestDNSServerProtocol:
+    """
+    Protocol holds a DNSServer reference (not a bare DNSHandler) so that
+    apply_config() handler swaps are immediately visible to in-flight queries.
 
-    def test_connection_made(self):
-        proto = DNSServerProtocol(DNSHandler(_cfg_with_record(), DNSCache()))
+    Root cause of the stale-record bug:
+        Old: DNSServerProtocol(handler)  — handler reference frozen at start-up.
+             apply_config() replaces DNSServer.handler; protocol never sees it.
+        Fix: DNSServerProtocol(server)   — self.server.handler re-read per packet.
+    """
+
+    def _server(self, ip: str = "1.2.3.4") -> DNSServer:
+        return DNSServer(_cfg_ip(ip))
+
+    # ── structure ─────────────────────────────────────────────────────────────
+
+    def test_holds_server_not_handler(self):
+        """Protocol must store a DNSServer, never a bare DNSHandler.
+
+        If this assertion fails the apply_config() fix has been reverted and
+        stale-record queries will reappear in production.
+        """
+        server = self._server()
+        proto  = DNSServerProtocol(server)
+        assert hasattr(proto, "server"), "proto must expose .server"
+        assert isinstance(proto.server, DNSServer)
+        assert not hasattr(proto, "handler") or proto.handler is None, (
+            "proto must NOT cache handler directly"
+        )
+
+    def test_connection_made_sets_transport(self):
+        proto = DNSServerProtocol(self._server())
         t = MagicMock()
         proto.connection_made(t)
         assert proto.transport is t
 
-    def test_datagram_received_sends_response(self):
-        proto = DNSServerProtocol(DNSHandler(_cfg_with_record(), DNSCache()))
+    # ── normal dispatch ───────────────────────────────────────────────────────
+
+    def test_datagram_sends_response(self):
+        proto = DNSServerProtocol(self._server())
         proto.transport = MagicMock()
         proto.datagram_received(_query(), ("127.0.0.1", 9000))
         proto.transport.sendto.assert_called_once()
         data, addr = proto.transport.sendto.call_args[0]
-        assert len(data) > 0
-        assert addr == ("127.0.0.1", 9000)
+        assert len(data) > 0 and addr == ("127.0.0.1", 9000)
 
-    def test_datagram_empty_response_not_sent(self):
-        """handler 返回 b'' 时不应调用 sendto。"""
-        proto = DNSServerProtocol(DNSHandler(_cfg_with_record(), DNSCache()))
+    def test_empty_response_not_sent(self):
+        proto = DNSServerProtocol(self._server())
         proto.transport = MagicMock()
-        proto.datagram_received(b"\x00\x01", ("127.0.0.1", 9000))   # 太短 → b""
+        proto.datagram_received(b"\x00\x01", ("127.0.0.1", 9000))  # too short → b""
         proto.transport.sendto.assert_not_called()
 
-    def test_datagram_handler_exception_swallowed(self):
-        """handler.handle() 抛出异常时不应向外传播。"""
-        h = MagicMock()
-        h.handle.side_effect = RuntimeError("crash")
-        proto = DNSServerProtocol(h)
+    def test_handler_exception_swallowed(self):
+        """Exception inside handler.handle() must be caught, not propagated."""
+        server = self._server()
+        server.handler = MagicMock()
+        server.handler.handle.side_effect = RuntimeError("crash")
+        proto = DNSServerProtocol(server)
         proto.transport = MagicMock()
         proto.datagram_received(b"\x00" * 20, ("127.0.0.1", 9000))
         proto.transport.sendto.assert_not_called()
 
     def test_error_received_no_raise(self):
-        proto = DNSServerProtocol(DNSHandler(_cfg_with_record(), DNSCache()))
-        proto.error_received(OSError("net err"))   # 不能抛出
+        DNSServerProtocol(self._server()).error_received(OSError("net err"))
+
+    # ── apply_config regression ───────────────────────────────────────────────
+
+    def test_serves_new_records_after_apply_config(self):
+        """After apply_config() the protocol must answer with the NEW records.
+
+        Scenario that was broken:
+          1. Server starts:  ping.t.lan → 1.1.1.1
+          2. apply_config(): ping.t.lan → 2.2.2.2
+          3. Query arrives.
+          Expected: 2.2.2.2   |   Bug: still 1.1.1.1 (stale handler reference)
+        """
+        server = DNSServer(_cfg_ip("1.1.1.1"))
+        proto  = DNSServerProtocol(server)
+        proto.transport = MagicMock()
+
+        def do_query():
+            proto.transport.reset_mock()
+            proto.datagram_received(_query(), ("127.0.0.1", 9000))
+            return parse_message(proto.transport.sendto.call_args[0][0])
+
+        assert do_query().answers[0].rdata == encode_a("1.1.1.1"), "pre-condition"
+
+        server.apply_config(_cfg_ip("2.2.2.2"))
+
+        assert do_query().answers[0].rdata == encode_a("2.2.2.2"), (
+            "REGRESSION: protocol served stale record after apply_config()"
+        )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# DNSServer — 同步方法
-# ──────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# DNSServer — synchronous methods
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class TestDNSServerSync:
 
@@ -143,8 +197,7 @@ class TestDNSServerSync:
         assert s._running is False
 
     def test_cache_stats(self):
-        s = DNSServer(_cfg())
-        assert "size" in s.cache_stats()
+        assert "size" in DNSServer(_cfg()).cache_stats()
 
     def test_reload_bad_path_no_raise(self):
         DNSServer(_cfg()).reload_config("/no/such/file.json")
@@ -165,10 +218,18 @@ class TestDNSServerSync:
         s.reload_config(p)
         assert s.cache.stats["size"] == 0
 
+    def test_apply_config_swaps_handler_and_clears_cache(self):
+        s = DNSServer(_cfg())
+        s.cache.set("x", QType.A, QClass.IN, DNSMessage(1, 0x8180), ttl=60)
+        old_handler = s.handler
+        s.apply_config(_cfg())
+        assert s.handler is not old_handler
+        assert s.cache.stats["size"] == 0
 
-# ──────────────────────────────────────────────────────────────────────────────
-# DNSServer — 异步方法
-# ──────────────────────────────────────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DNSServer — async tasks
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class TestDNSServerAsync:
 
@@ -186,34 +247,29 @@ class TestDNSServerAsync:
             assert s._running is False
         asyncio.run(run())
 
-    def test_watch_config_reloads_stale(self, tmp_path):
-        """_watch_config 在 is_stale() 时调用 reload_config。"""
+    def test_watch_config_reloads_when_stale(self, tmp_path):
         p = _write_cfg(tmp_path / "c.json", hot_reload=True)
         cfg = load_config(p)
-
         reloaded = []
 
         async def run():
             s = DNSServer(cfg)
             s._running = True
             s.config.server.hot_reload = True
-            s.config._mtime = 0.0       # 强制 is_stale() → True
+            s.config._mtime = 0.0
 
             def fake_reload(path=None):
                 reloaded.append(1)
-                s._running = False      # 让循环退出
+                s._running = False
 
             s.reload_config = fake_reload
-
-            # 用计数器防止无限循环（最多 100 次）
             call_count = [0]
-            real_sleep = asyncio.sleep
 
             async def fast_sleep(delay):
                 call_count[0] += 1
                 if call_count[0] > 100:
                     s._running = False
-                await real_sleep(0)     # 真正 yield，避免死递归
+                await asyncio.sleep(0)
 
             with patch("nanodns.server.asyncio.sleep", side_effect=fast_sleep):
                 await s._watch_config()
@@ -222,26 +278,19 @@ class TestDNSServerAsync:
         assert len(reloaded) >= 1
 
     def test_watch_config_no_reload_when_fresh(self, tmp_path):
-        """is_stale() 返回 False 时不应调用 reload_config。"""
         p = _write_cfg(tmp_path / "c.json", hot_reload=False)
         cfg = load_config(p)
-
         reloaded = []
-        call_count = [0]
 
         async def run():
             s = DNSServer(cfg)
             s._running = True
             s.config.server.hot_reload = False
-
             s.reload_config = lambda path=None: reloaded.append(1)
 
-            real_sleep = asyncio.sleep
-
             async def fast_sleep(delay):
-                call_count[0] += 1
-                s._running = False      # 第一次就停
-                await real_sleep(0)
+                s._running = False
+                await asyncio.sleep(0)
 
             with patch("nanodns.server.asyncio.sleep", side_effect=fast_sleep):
                 await s._watch_config()
@@ -250,25 +299,22 @@ class TestDNSServerAsync:
         assert len(reloaded) == 0
 
     def test_prune_cache_called(self):
-        """_prune_cache 每轮都应调用 cache.prune()。"""
         prune_calls = [0]
 
         async def run():
             s = DNSServer(_cfg())
             s._running = True
-            orig_prune = s.cache.prune
+            orig = s.cache.prune
 
             def counting_prune():
                 prune_calls[0] += 1
-                orig_prune()
+                orig()
 
             s.cache.prune = counting_prune
 
-            real_sleep = asyncio.sleep
-
             async def fast_sleep(delay):
                 s._running = False
-                await real_sleep(0)
+                await asyncio.sleep(0)
 
             with patch("nanodns.server.asyncio.sleep", side_effect=fast_sleep):
                 await s._prune_cache()
@@ -277,21 +323,21 @@ class TestDNSServerAsync:
         assert prune_calls[0] == 1
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
 # setup_logging
-# ──────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class TestSetupLogging:
     def test_info(self):    setup_logging("INFO")
     def test_debug(self):   setup_logging("DEBUG")
     def test_warning(self): setup_logging("WARNING")
     def test_error(self):   setup_logging("ERROR")
-    def test_bad(self):     setup_logging("NOTREAL")   # getattr fallback → INFO
+    def test_invalid(self): setup_logging("NOTREAL")   # getattr fallback → INFO
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
 # run_server
-# ──────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class TestRunServer:
 
@@ -307,30 +353,19 @@ class TestRunServer:
         asyncio.run(run())
 
     def test_windows_signal_not_implemented(self):
-        """add_signal_handler 抛出 NotImplementedError 时应忽略（Windows）。"""
+        """add_signal_handler raising NotImplementedError must be silently ignored."""
         async def run():
             cfg = _cfg(port=0)
             real_loop = asyncio.get_event_loop()
-
             mock_loop = MagicMock(wraps=real_loop)
             mock_loop.add_signal_handler.side_effect = NotImplementedError
             mock_loop.create_datagram_endpoint = real_loop.create_datagram_endpoint
 
-            bg = []
-            real_ct = asyncio.create_task
-
-            def track(coro, **kw):
-                t = real_ct(coro, **kw)
-                bg.append(t)
-                return t
-
             with patch("nanodns.server.asyncio.get_running_loop",
                        return_value=mock_loop):
-                outer = real_ct(run_server(cfg))
+                outer = asyncio.create_task(run_server(cfg))
                 await asyncio.sleep(0.05)
                 outer.cancel()
-                for t in bg:
-                    t.cancel()
                 try:
                     await outer
                 except (asyncio.CancelledError, Exception):
@@ -339,9 +374,9 @@ class TestRunServer:
         asyncio.run(run())
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
 # CLI — init
-# ──────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class TestCLIInit:
 
@@ -358,22 +393,21 @@ class TestCLIInit:
         assert "server" in json.loads(Path(out).read_text())
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
 # CLI — check
-# ──────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class TestCLICheck:
 
-    def _valid_file(self, tmp_path):
+    def _valid(self, tmp_path):
         return _write_cfg(tmp_path / "v.json",
                           port=5353, upstream=["8.8.8.8"], log_level="INFO")
 
     def test_valid_exit_0(self, tmp_path):
-        code, _, _ = _run_cli(["check", self._valid_file(tmp_path)])
-        assert code == 0
+        assert _run_cli(["check", self._valid(tmp_path)])[0] == 0
 
     def test_valid_shows_summary(self, tmp_path):
-        _, out, _ = _run_cli(["check", self._valid_file(tmp_path)])
+        _, out, _ = _run_cli(["check", self._valid(tmp_path)])
         assert any(k in out for k in ("valid", "OK", "Records", "Upstream"))
 
     def test_missing_file_exit_1(self, tmp_path):
@@ -387,9 +421,9 @@ class TestCLICheck:
         assert code == 1 and len(err) > 0
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
 # CLI — start
-# ──────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class TestCLIStart:
 
@@ -397,7 +431,7 @@ class TestCLIStart:
         return _write_cfg(tmp_path / "cfg.json",
                           port=port, log_level="INFO", **kw)
 
-    # ── 错误路径 ─────────────────────────────────────────────────────────────
+    # ── error paths ───────────────────────────────────────────────────────────
 
     def test_missing_config_exit_1(self, tmp_path):
         code, _, err = _run_cli(["start", "--config", str(tmp_path / "no.json")])
@@ -406,18 +440,16 @@ class TestCLIStart:
     def test_bad_json_exit_1(self, tmp_path):
         p = tmp_path / "bad.json"
         p.write_text("{bad}")
-        code, _, _ = _run_cli(["start", "--config", str(p)])
-        assert code == 1
+        assert _run_cli(["start", "--config", str(p)])[0] == 1
 
-    # ── CLI 覆盖项 ───────────────────────────────────────────────────────────
+    # ── CLI overrides ─────────────────────────────────────────────────────────
 
     def test_host_override(self, tmp_path):
         cap = {}
         async def fake(cfg): cap["host"] = cfg.server.host
         with patch("nanodns.cli.run_server", side_effect=fake), \
              patch("nanodns.cli.setup_logging"):
-            _run_cli(["start", "--config", self._p(tmp_path),
-                      "--host", "10.0.0.1"])
+            _run_cli(["start", "--config", self._p(tmp_path), "--host", "10.0.0.1"])
         assert cap.get("host") == "10.0.0.1"
 
     def test_port_override(self, tmp_path):
@@ -425,8 +457,7 @@ class TestCLIStart:
         async def fake(cfg): cap["port"] = cfg.server.port
         with patch("nanodns.cli.run_server", side_effect=fake), \
              patch("nanodns.cli.setup_logging"):
-            _run_cli(["start", "--config", self._p(tmp_path),
-                      "--port", "5353"])
+            _run_cli(["start", "--config", self._p(tmp_path), "--port", "5353"])
         assert cap.get("port") == 5353
 
     def test_loglevel_override(self, tmp_path):
@@ -434,8 +465,7 @@ class TestCLIStart:
         async def fake(cfg): cap["level"] = cfg.server.log_level
         with patch("nanodns.cli.run_server", side_effect=fake), \
              patch("nanodns.cli.setup_logging"):
-            _run_cli(["start", "--config", self._p(tmp_path),
-                      "--log-level", "DEBUG"])
+            _run_cli(["start", "--config", self._p(tmp_path), "--log-level", "DEBUG"])
         assert cap.get("level") == "DEBUG"
 
     def test_no_cache_flag(self, tmp_path):
@@ -446,10 +476,10 @@ class TestCLIStart:
             _run_cli(["start", "--config", self._p(tmp_path), "--no-cache"])
         assert cap.get("cache") is False
 
-    def test_no_overrides(self, tmp_path):
+    def test_no_overrides_uses_config_values(self, tmp_path):
         cap = {}
         async def fake(cfg):
-            cap["host"] = cfg.server.host
+            cap["host"]  = cfg.server.host
             cap["cache"] = cfg.server.cache_enabled
         with patch("nanodns.cli.run_server", side_effect=fake), \
              patch("nanodns.cli.setup_logging"):
@@ -472,49 +502,41 @@ class TestCLIStart:
             _run_cli(["start", "--config", self._p(tmp_path)])
         assert len(calls) == 1
 
-    # ── 端口权限警告分支 ─────────────────────────────────────────────────────
+    # ── privilege-check branches ──────────────────────────────────────────────
 
     def test_low_port_unix_nonroot(self, tmp_path):
-        """port<1024 + 非 root → 警告分支执行，不崩溃。"""
         import nanodns.cli as _cli_mod
         async def fake(cfg): pass
         with patch("nanodns.cli.run_server", side_effect=fake), \
              patch("nanodns.cli.setup_logging"), \
              patch.object(_cli_mod.os, "geteuid", return_value=1000, create=True):
-            code, _, _ = _run_cli(["start", "--config",
-                                    self._p(tmp_path, port=53)])
+            code, _, _ = _run_cli(["start", "--config", self._p(tmp_path, port=53)])
         assert code == 0
 
     def test_low_port_unix_root(self, tmp_path):
-        """port<1024 + root → is_admin=True，不打警告。"""
         import nanodns.cli as _cli_mod
         async def fake(cfg): pass
         with patch("nanodns.cli.run_server", side_effect=fake), \
              patch("nanodns.cli.setup_logging"), \
              patch.object(_cli_mod.os, "geteuid", return_value=0, create=True):
-            code, _, _ = _run_cli(["start", "--config",
-                                    self._p(tmp_path, port=53)])
+            code, _, _ = _run_cli(["start", "--config", self._p(tmp_path, port=53)])
         assert code == 0
 
     def test_low_port_windows_fallback(self, tmp_path):
-        """geteuid → AttributeError → ctypes 路径（Windows 兼容分支）。"""
         import nanodns.cli as _cli_mod
         async def fake(cfg): pass
-        mock_ctypes = MagicMock(spec=[])   # spec=[] 所有属性访问都抛 AttributeError
+        mock_ctypes = MagicMock(spec=[])
         with patch("nanodns.cli.run_server", side_effect=fake), \
              patch("nanodns.cli.setup_logging"), \
              patch.object(_cli_mod.os, "geteuid",
                           side_effect=AttributeError, create=True), \
              patch.dict("sys.modules", {"ctypes": mock_ctypes}):
-            code, _, _ = _run_cli(["start", "--config",
-                                    self._p(tmp_path, port=53)])
+            code, _, _ = _run_cli(["start", "--config", self._p(tmp_path, port=53)])
         assert code == 0
 
-    def test_high_port_no_privilege_check(self, tmp_path):
-        """port≥1024 → 权限检查块整体跳过。"""
+    def test_high_port_skips_privilege_check(self, tmp_path):
         async def fake(cfg): pass
         with patch("nanodns.cli.run_server", side_effect=fake), \
              patch("nanodns.cli.setup_logging"):
-            code, _, _ = _run_cli(["start", "--config",
-                                    self._p(tmp_path, port=5353)])
+            code, _, _ = _run_cli(["start", "--config", self._p(tmp_path, port=5353)])
         assert code == 0
