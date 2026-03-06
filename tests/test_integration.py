@@ -27,8 +27,6 @@ from nanodns.protocol import (
     build_message, parse_message,
 )
 from nanodns.config import _parse_config
-from nanodns.cache import DNSCache
-from nanodns.handler import DNSHandler
 from nanodns.server import DNSServerProtocol
 
 
@@ -121,13 +119,13 @@ class LiveServer:
         self._loop.run_until_complete(self._serve())
 
     async def _serve(self):
+        from nanodns.server import DNSServer
         cfg = _parse_config(self._config, None)
-        cache = DNSCache(max_size=cfg.server.cache_size)
-        handler = DNSHandler(cfg, cache)
+        server = DNSServer(cfg)
 
         loop = asyncio.get_running_loop()
         transport, protocol = await loop.create_datagram_endpoint(
-            lambda: DNSServerProtocol(handler),
+            lambda: DNSServerProtocol(server),
             local_addr=(self.host, 0),   # port=0 → random free port
         )
         self._transport = transport

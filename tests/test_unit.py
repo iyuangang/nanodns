@@ -812,3 +812,514 @@ class TestResolver:
         with patch("nanodns.resolver.socket.socket", return_value=mock_sock):
             with pytest.raises(socket.timeout):
                 _query_udp(b"\x00" * 12, "8.8.8.8", 53, 0.1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Server
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestDNSServerProtocol:
+    """
+    DNSServerProtocol now holds a reference to DNSServer (not DNSHandler directly),
+    so that apply_config() handler swaps are visible to the protocol immediately.
+
+    Root-cause of the "stale records after reload" bug:
+        Old: DNSServerProtocol(handler)  → self.handler captured at start-up time.
+             apply_config() replaces DNSServer.handler but protocol keeps the old object.
+        Fix: DNSServerProtocol(server)   → self.server.handler looked up on every packet.
+    """
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _make_cfg(self, records=None, zone="t.lan"):
+        return _parse_config({
+            "server": {
+                "host": "127.0.0.1", "port": 5353, "upstream": [],
+                "log_queries": False, "hot_reload": False,
+                "cache_enabled": True, "cache_ttl": 300, "cache_size": 100,
+                "log_level": "WARNING", "upstream_timeout": 2, "upstream_port": 53,
+            },
+            "zones": {zone: {}},
+            "records": records or [
+                {"name": "a.t.lan", "type": "A", "value": "1.2.3.4", "ttl": 60}
+            ],
+            "rewrites": [],
+        }, None)
+
+    def _make_server(self, records=None):
+        from nanodns.server import DNSServer
+        return DNSServer(self._make_cfg(records))
+
+    # ── construction ──────────────────────────────────────────────────────────
+
+    def test_protocol_holds_server_not_handler(self):
+        """Protocol must store a DNSServer reference, not a bare DNSHandler.
+
+        If this fails, the apply_config() fix was reverted — stale-record bug
+        will reappear.
+        """
+        from nanodns.server import DNSServerProtocol, DNSServer
+        server = self._make_server()
+        proto = DNSServerProtocol(server)
+        assert hasattr(proto, "server"), "proto must expose .server"
+        assert isinstance(proto.server, DNSServer), "proto.server must be a DNSServer"
+        assert not hasattr(proto, "handler") or proto.handler is None, (
+            "proto must NOT cache handler directly — that caused the stale-record bug"
+        )
+
+    def test_connection_made_sets_transport(self):
+        from nanodns.server import DNSServerProtocol
+        proto = DNSServerProtocol(self._make_server())
+        transport = MagicMock()
+        proto.connection_made(transport)
+        assert proto.transport is transport
+
+    # ── normal query dispatch ─────────────────────────────────────────────────
+
+    def test_datagram_received_sends_response(self):
+        from nanodns.server import DNSServerProtocol
+        proto = DNSServerProtocol(self._make_server())
+        proto.transport = MagicMock()
+
+        msg = DNSMessage(msg_id=1, flags=0x0100)
+        msg.questions.append(DNSQuestion("a.t.lan", QType.A, QClass.IN))
+        proto.datagram_received(build_message(msg), ("127.0.0.1", 1234))
+
+        proto.transport.sendto.assert_called_once()
+        raw = proto.transport.sendto.call_args[0][0]
+        assert isinstance(raw, bytes) and len(raw) > 0
+
+    def test_datagram_received_empty_response_not_sent(self):
+        from nanodns.server import DNSServerProtocol
+        proto = DNSServerProtocol(self._make_server())
+        proto.transport = MagicMock()
+        proto.datagram_received(b"\x00\x01", ("127.0.0.1", 1234))  # malformed
+        proto.transport.sendto.assert_not_called()
+
+    def test_datagram_received_handler_exception_logged(self):
+        """Exception inside handler.handle() must be caught and logged, not propagated."""
+        from nanodns.server import DNSServerProtocol, DNSServer
+        server = self._make_server()
+        server.handler = MagicMock()
+        server.handler.handle.side_effect = RuntimeError("boom")
+        proto = DNSServerProtocol(server)
+        proto.transport = MagicMock()
+        proto.datagram_received(b"\x00" * 12, ("127.0.0.1", 1234))  # must not raise
+        proto.transport.sendto.assert_not_called()
+
+    def test_error_received_logs(self):
+        from nanodns.server import DNSServerProtocol
+        proto = DNSServerProtocol(self._make_server())
+        proto.error_received(OSError("network error"))  # must not raise
+
+    # ── THE critical regression test ──────────────────────────────────────────
+
+    def test_protocol_uses_handler_after_apply_config(self):
+        """After apply_config(), the protocol must serve records from the NEW config.
+
+        This is the exact scenario that was broken:
+          1. Server starts with record  db.t.lan → 1.1.1.1
+          2. Config reloaded → db.t.lan → 2.2.2.2  (apply_config swaps DNSServer.handler)
+          3. Protocol receives a query for db.t.lan
+          4. EXPECTED: response contains 2.2.2.2
+          5. BUG (before fix): response still contained 1.1.1.1 because the
+             protocol held the old handler object and never saw the swap.
+        """
+        from nanodns.server import DNSServerProtocol, DNSServer
+
+        # --- v1 config: db.t.lan → 1.1.1.1 ---
+        server = self._make_server(records=[
+            {"name": "db.t.lan", "type": "A", "value": "1.1.1.1", "ttl": 60}
+        ])
+        proto = DNSServerProtocol(server)
+        proto.transport = MagicMock()
+
+        def query_db():
+            proto.transport.reset_mock()
+            msg = DNSMessage(msg_id=1, flags=0x0100)
+            msg.questions.append(DNSQuestion("db.t.lan", QType.A, QClass.IN))
+            proto.datagram_received(build_message(msg), ("127.0.0.1", 1234))
+            raw = proto.transport.sendto.call_args[0][0]
+            return parse_message(raw)
+
+        resp_before = query_db()
+        assert resp_before.answers[0].rdata == encode_a("1.1.1.1"), (
+            "pre-condition: v1 record should return 1.1.1.1"
+        )
+
+        # --- apply_config: db.t.lan → 2.2.2.2 ---
+        new_cfg = self._make_cfg(records=[
+            {"name": "db.t.lan", "type": "A", "value": "2.2.2.2", "ttl": 60}
+        ])
+        server.apply_config(new_cfg)   # swaps server.handler in-place
+
+        resp_after = query_db()
+        assert resp_after.answers[0].rdata == encode_a("2.2.2.2"), (
+            "REGRESSION: protocol returned stale 1.1.1.1 after apply_config(); "
+            "protocol must read handler via self.server.handler, not a cached reference"
+        )
+
+
+class TestDNSServer:
+
+    def _cfg(self, **overrides):
+        base = {
+            "server": {"host": "127.0.0.1", "port": 5353, "upstream": [],
+                       "log_queries": False, "hot_reload": False,
+                       "cache_enabled": True, "cache_ttl": 300, "cache_size": 50,
+                       "log_level": "WARNING", "upstream_timeout": 2, "upstream_port": 53},
+            "zones": {}, "records": [], "rewrites": [],
+        }
+        base["server"].update(overrides)
+        return _parse_config(base, None)
+
+    def test_init_creates_handler_and_cache(self):
+        from nanodns.server import DNSServer
+        server = DNSServer(self._cfg())
+        assert server.cache is not None
+        assert server.handler is not None
+        assert server._running is False
+
+    def test_cache_stats(self):
+        from nanodns.server import DNSServer
+        server = DNSServer(self._cfg())
+        stats = server.cache_stats()
+        assert "size" in stats and "hits" in stats
+
+    def test_reload_config_success(self, tmp_path):
+        from nanodns.server import DNSServer
+        import json
+        p = tmp_path / "cfg.json"
+        data = {
+            "server": {"host": "127.0.0.1", "port": 5353, "upstream": [],
+                       "log_queries": False, "hot_reload": True,
+                       "cache_enabled": True, "cache_ttl": 60, "cache_size": 50,
+                       "log_level": "WARNING", "upstream_timeout": 2, "upstream_port": 53},
+            "zones": {}, "records": [], "rewrites": [],
+        }
+        p.write_text(json.dumps(data))
+        cfg = _parse_config(data, p)
+        server = DNSServer(cfg)
+        server.reload_config(str(p))
+        assert server.config is not None
+
+    def test_reload_config_bad_path_logs_error(self):
+        from nanodns.server import DNSServer
+        server = DNSServer(self._cfg())
+        # Should not raise — just log the error
+        server.reload_config("/nonexistent/path.json")
+
+    def test_start_and_stop(self):
+        """Start the server on a random port and immediately cancel it."""
+        from nanodns.server import DNSServer
+        import asyncio
+
+        async def run():
+            server = DNSServer(self._cfg(port=0))
+            task = asyncio.create_task(server.start())
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.run(run())
+
+    def test_watch_config_reloads_when_stale(self, tmp_path):
+        """_watch_config calls reload_config when config is stale."""
+        import asyncio, json
+        from nanodns.server import DNSServer
+
+        data = {
+            "server": {"host": "127.0.0.1", "port": 5353, "upstream": [],
+                       "log_queries": False, "hot_reload": True,
+                       "cache_enabled": True, "cache_ttl": 60, "cache_size": 50,
+                       "log_level": "WARNING", "upstream_timeout": 2, "upstream_port": 53},
+            "zones": {}, "records": [], "rewrites": [],
+        }
+        p = tmp_path / "cfg.json"
+        p.write_text(json.dumps(data))
+        cfg = _parse_config(data, p)
+        server = DNSServer(cfg)
+        server._running = True
+
+        reloaded = []
+        def mock_reload(path=None):
+            reloaded.append(True)
+            server._running = False
+        server.reload_config = mock_reload
+        server.config._mtime = 0.0
+        server.config.server.hot_reload = True
+
+        async def fast_sleep(t): pass
+
+        async def run():
+            with patch("asyncio.sleep", side_effect=fast_sleep):
+                await server._watch_config()
+
+        asyncio.run(run())
+        assert len(reloaded) == 1
+
+    def test_prune_cache_runs(self):
+        """_prune_cache prunes and logs stats."""
+        import asyncio
+        from nanodns.server import DNSServer
+
+        server = DNSServer(self._cfg())
+        server._running = True
+        call_count = [0]
+
+        async def run():
+            original_sleep = asyncio.sleep
+            async def mock_sleep(t):
+                call_count[0] += 1
+                server._running = False  # stop after first iteration
+            with patch("asyncio.sleep", side_effect=mock_sleep):
+                await server._prune_cache()
+
+        asyncio.run(run())
+        assert call_count[0] == 1
+
+
+class TestSetupLogging:
+
+    def test_setup_logging_info(self):
+        from nanodns.server import setup_logging
+        setup_logging("INFO")   # should not raise
+
+    def test_setup_logging_debug(self):
+        from nanodns.server import setup_logging
+        setup_logging("DEBUG")
+
+    def test_setup_logging_invalid_falls_back(self):
+        from nanodns.server import setup_logging
+        setup_logging("NOTAREAL")  # getattr fallback → logging.INFO
+
+
+class TestRunServer:
+
+    def test_run_server_stops_on_event(self):
+        """run_server cancels cleanly when stop_event fires."""
+        import asyncio
+        from nanodns.server import run_server
+        from nanodns.config import _parse_config
+
+        cfg = _parse_config({
+            "server": {"host": "127.0.0.1", "port": 0, "upstream": [],
+                       "log_queries": False, "hot_reload": False,
+                       "cache_enabled": False, "cache_ttl": 60, "cache_size": 50,
+                       "log_level": "WARNING", "upstream_timeout": 2, "upstream_port": 53},
+            "zones": {}, "records": [], "rewrites": [],
+        }, None)
+
+        async def run():
+            task = asyncio.create_task(run_server(cfg))
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.run(run())
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CLI
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestCLI:
+
+    def _run(self, args: list[str]) -> tuple[int, str, str]:
+        """Run CLI main() with given argv, capturing stdout/stderr and exit code."""
+        import io
+        from nanodns.cli import main
+
+        stdout_buf = io.StringIO()
+        stderr_buf = io.StringIO()
+        exit_code = 0
+
+        with patch("sys.argv", ["nanodns"] + args), \
+             patch("sys.stdout", stdout_buf), \
+             patch("sys.stderr", stderr_buf):
+            try:
+                main()
+            except SystemExit as e:
+                exit_code = int(e.code) if e.code is not None else 0
+
+        return exit_code, stdout_buf.getvalue(), stderr_buf.getvalue()
+
+    # ── init ──────────────────────────────────────────────────────────────────
+
+    def test_init_default_path(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        code, out, _ = self._run(["init"])
+        assert code == 0
+        assert (tmp_path / "nanodns.json").exists()
+
+    def test_init_custom_path(self, tmp_path):
+        out_file = str(tmp_path / "custom.json")
+        code, _, _ = self._run(["init", out_file])
+        assert code == 0
+        import json
+        data = json.loads(open(out_file).read())
+        assert "server" in data
+
+    # ── check ─────────────────────────────────────────────────────────────────
+
+    def test_check_valid_config(self, tmp_path):
+        import json
+        cfg_file = tmp_path / "cfg.json"
+        cfg_file.write_text(json.dumps({
+            "server": {"host": "0.0.0.0", "port": 5353, "upstream": ["8.8.8.8"],
+                       "log_queries": False, "hot_reload": False,
+                       "cache_enabled": True, "cache_ttl": 300, "cache_size": 100,
+                       "log_level": "INFO", "upstream_timeout": 3, "upstream_port": 53},
+            "zones": {}, "records": [], "rewrites": [],
+        }))
+        code, out, _ = self._run(["check", str(cfg_file)])
+        assert code == 0
+        assert "valid" in out.lower() or "✓" in out
+
+    def test_check_missing_file(self, tmp_path):
+        code, _, err = self._run(["check", str(tmp_path / "missing.json")])
+        assert code != 0
+
+    def test_check_invalid_json(self, tmp_path):
+        bad = tmp_path / "bad.json"
+        bad.write_text("{ not valid json }")
+        code, _, err = self._run(["check", str(bad)])
+        assert code != 0
+
+    # ── start ─────────────────────────────────────────────────────────────────
+
+    def test_start_missing_config_file(self, tmp_path):
+        code, _, err = self._run(["start", "--config", str(tmp_path / "missing.json")])
+        assert code != 0
+
+    def test_start_invalid_config(self, tmp_path):
+        bad = tmp_path / "bad.json"
+        bad.write_text("{ bad }")
+        code, _, err = self._run(["start", "--config", str(bad)])
+        assert code != 0
+
+    def test_start_applies_cli_overrides(self, tmp_path):
+        import json, asyncio
+        cfg_file = tmp_path / "cfg.json"
+        cfg_file.write_text(json.dumps({
+            "server": {"host": "0.0.0.0", "port": 5353, "upstream": [],
+                       "log_queries": False, "hot_reload": False,
+                       "cache_enabled": True, "cache_ttl": 300, "cache_size": 100,
+                       "log_level": "INFO", "upstream_timeout": 3, "upstream_port": 53},
+            "zones": {}, "records": [], "rewrites": [],
+        }))
+        captured = {}
+
+        async def fake_run_server(cfg):
+            captured["host"] = cfg.server.host
+            captured["port"] = cfg.server.port
+            captured["log_level"] = cfg.server.log_level
+            captured["cache"] = cfg.server.cache_enabled
+
+        with patch("nanodns.cli.run_server", side_effect=fake_run_server), \
+             patch("nanodns.cli.setup_logging"):
+            self._run([
+                "start", "--config", str(cfg_file),
+                "--host", "192.168.1.1",
+                "--port", "5353",
+                "--log-level", "DEBUG",
+                "--no-cache",
+            ])
+
+        assert captured.get("host") == "192.168.1.1"
+        assert captured.get("port") == 5353
+        assert captured.get("log_level") == "DEBUG"
+        assert captured.get("cache") is False
+
+    def test_start_default_config_no_overrides(self, tmp_path):
+        import json
+        cfg_file = tmp_path / "cfg.json"
+        cfg_file.write_text(json.dumps({
+            "server": {"host": "0.0.0.0", "port": 5353, "upstream": [],
+                       "log_queries": False, "hot_reload": False,
+                       "cache_enabled": True, "cache_ttl": 300, "cache_size": 100,
+                       "log_level": "INFO", "upstream_timeout": 3, "upstream_port": 53},
+            "zones": {}, "records": [], "rewrites": [],
+        }))
+        captured = {}
+
+        async def fake_run_server(cfg):
+            captured["host"] = cfg.server.host
+            captured["cache"] = cfg.server.cache_enabled
+
+        with patch("nanodns.cli.run_server", side_effect=fake_run_server), \
+             patch("nanodns.cli.setup_logging"):
+            self._run(["start", "--config", str(cfg_file)])
+
+        assert captured.get("host") == "0.0.0.0"
+        assert captured.get("cache") is True
+
+    def test_start_keyboard_interrupt_handled(self, tmp_path):
+        import json
+        cfg_file = tmp_path / "cfg.json"
+        cfg_file.write_text(json.dumps({
+            "server": {"host": "0.0.0.0", "port": 5353, "upstream": [],
+                       "log_queries": False, "hot_reload": False,
+                       "cache_enabled": True, "cache_ttl": 300, "cache_size": 100,
+                       "log_level": "INFO", "upstream_timeout": 3, "upstream_port": 53},
+            "zones": {}, "records": [], "rewrites": [],
+        }))
+
+        async def fake_run_server(cfg):
+            raise KeyboardInterrupt
+
+        with patch("nanodns.cli.run_server", side_effect=fake_run_server), \
+             patch("nanodns.cli.setup_logging"):
+            code, _, _ = self._run(["start", "--config", str(cfg_file)])
+        # KeyboardInterrupt should be swallowed, not crash
+        assert code == 0
+
+    def test_start_port_warning_low_port(self, tmp_path):
+        """port < 1024 triggers privilege warning branch."""
+        import json
+        cfg_file = tmp_path / "cfg.json"
+        cfg_file.write_text(json.dumps({
+            "server": {"host": "0.0.0.0", "port": 53, "upstream": [],
+                       "log_queries": False, "hot_reload": False,
+                       "cache_enabled": True, "cache_ttl": 300, "cache_size": 100,
+                       "log_level": "INFO", "upstream_timeout": 3, "upstream_port": 53},
+            "zones": {}, "records": [], "rewrites": [],
+        }))
+
+        async def fake_run_server(cfg):
+            pass
+
+        # Force non-admin path
+        with patch("nanodns.cli.run_server", side_effect=fake_run_server), \
+             patch("nanodns.cli.setup_logging"), \
+             patch("os.geteuid", return_value=1000):  # non-root
+            self._run(["start", "--config", str(cfg_file)])
+        # No assertion needed — just ensure it doesn't crash
+
+    def test_start_port_warning_windows_path(self, tmp_path):
+        """Simulate Windows where os.geteuid doesn't exist."""
+        import json
+        cfg_file = tmp_path / "cfg.json"
+        cfg_file.write_text(json.dumps({
+            "server": {"host": "0.0.0.0", "port": 53, "upstream": [],
+                       "log_queries": False, "hot_reload": False,
+                       "cache_enabled": True, "cache_ttl": 300, "cache_size": 100,
+                       "log_level": "INFO", "upstream_timeout": 3, "upstream_port": 53},
+            "zones": {}, "records": [], "rewrites": [],
+        }))
+
+        async def fake_run_server(cfg):
+            pass
+
+        # Simulate missing geteuid (Windows)
+        import os as _os
+        with patch("nanodns.cli.run_server", side_effect=fake_run_server), \
+             patch("nanodns.cli.setup_logging"), \
+             patch.object(_os, "geteuid", side_effect=AttributeError, create=True):
+            self._run(["start", "--config", str(cfg_file)])
