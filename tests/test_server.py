@@ -264,12 +264,13 @@ class TestDNSServerAsync:
 
             s.reload_config = fake_reload
             call_count = [0]
+            _real_sleep = asyncio.sleep   # capture before patch replaces it
 
             async def fast_sleep(delay):
                 call_count[0] += 1
                 if call_count[0] > 100:
                     s._running = False
-                await asyncio.sleep(0)
+                await _real_sleep(0)      # use the real coroutine, not the mock
 
             with patch("nanodns.server.asyncio.sleep", side_effect=fast_sleep):
                 await s._watch_config()
@@ -287,10 +288,11 @@ class TestDNSServerAsync:
             s._running = True
             s.config.server.hot_reload = False
             s.reload_config = lambda path=None: reloaded.append(1)
+            _real_sleep = asyncio.sleep
 
             async def fast_sleep(delay):
                 s._running = False
-                await asyncio.sleep(0)
+                await _real_sleep(0)
 
             with patch("nanodns.server.asyncio.sleep", side_effect=fast_sleep):
                 await s._watch_config()
@@ -311,10 +313,11 @@ class TestDNSServerAsync:
                 orig()
 
             s.cache.prune = counting_prune
+            _real_sleep = asyncio.sleep
 
             async def fast_sleep(delay):
                 s._running = False
-                await asyncio.sleep(0)
+                await _real_sleep(0)
 
             with patch("nanodns.server.asyncio.sleep", side_effect=fast_sleep):
                 await s._prune_cache()
