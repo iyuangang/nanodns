@@ -45,11 +45,9 @@ BIND config file that requires a PhD to edit.
 | | NanoDNS | Pi-hole | CoreDNS | dnsmasq |
 |---|:---:|:---:|:---:|:---:|
 | Zero pip dependencies | ✅ | ❌ | ❌ | ❌ |
+| Built-in multi-node HA sync | ✅ | ❌ | ❌ | ❌ |
 | Edit config with any text editor | ✅ | ⚠️ | ⚠️ | ⚠️ |
 | Hot-reload without restart | ✅ | ❌ | ✅ | ❌ |
-| Built-in multi-node HA sync | ✅ | ❌ | ❌ | ❌ |
-| `pip install` on any OS | ✅ | ❌ | ❌ | ❌ |
-| Runs on Python 3.10+ stdlib only | ✅ | ❌ | ❌ | ❌ |
 
 > **NanoDNS is for people who want DNS to be boring** — not a project in itself.
 
@@ -325,17 +323,17 @@ Pre-built packages are available on the [releases page](https://github.com/iyuan
 
 ```bash
 # RHEL / Rocky Linux / AlmaLinux / Fedora
-sudo dnf install ./nanodns-server-*.noarch.rpm
+sudo dnf install ./nanodns-*.noarch.rpm
 
 # Debian / Ubuntu
-sudo apt install ./nanodns-server_*.deb
+sudo apt install ./nanodns_*.deb
 ```
 
 Or build from source (no system packaging tools needed):
 
 ```bash
-python3 packaging/build_rpm.py          # → dist/nanodns-server-*.rpm
-python3 packaging/build_deb.py          # → dist/nanodns-server_*.deb
+python3 packaging/build_rpm.py          # → dist/nanodns-*.rpm
+python3 packaging/build_deb.py          # → dist/nanodns_*.deb
 python3 packaging/build_packages.py --all   # both at once
 ```
 

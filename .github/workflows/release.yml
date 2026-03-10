@@ -32,6 +32,7 @@ permissions:
   contents: read
   packages: write
   id-token: write
+  attestations: write   # required by actions/attest for both PyPI and Docker
 
 concurrency:
   group: release-${{ github.ref }}
@@ -130,6 +131,22 @@ jobs:
           echo "whl=$(basename dist/*.whl)"     >> $GITHUB_OUTPUT
           echo "sdist=$(basename dist/*.tar.gz)" >> $GITHUB_OUTPUT
 
+      # ── Attest wheel ────────────────────────────────────────────────────────
+      # Generates a GitHub-signed provenance attestation for the wheel and
+      # uploads it to the repository's attestations store.
+      # Verify later with:
+      #   gh attestation verify nanodns-*.whl --repo iyuangang/nanodns
+      - name: Attest wheel provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/${{ steps.filenames.outputs.whl }}
+
+      # ── Attest sdist ────────────────────────────────────────────────────────
+      - name: Attest sdist provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/${{ steps.filenames.outputs.sdist }}
+
       - uses: actions/upload-artifact@v4
         with:
           name: dist
@@ -150,7 +167,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        python-version: ["3.10", "3.12"]
+        python-version: ["3.10", "3.12", "3.14"]
 
     permissions:
       contents: read
@@ -220,6 +237,7 @@ jobs:
           R_SCAN:     ${{ needs.scan.result }}
           R_SIGN:     ${{ needs.sign.result }}
           R_SIGVER:   ${{ needs.verify-signature.result }}
+          REPO:       ${{ github.repository }}
           REF_NAME:   ${{ github.ref_name }}
           SHA:        ${{ github.sha }}
         shell: python
@@ -232,6 +250,7 @@ jobs:
           image    = env["GHCR"]
           ref      = env["REF_NAME"]
           sha      = env["SHA"]
+          repo     = env["REPO"]
 
           results = {
               "build":     env["R_BUILD"],
@@ -293,6 +312,28 @@ jobs:
               "",
               "---",
               "",
+              "## 🔏 Verify authenticity",
+              "",
+              "**PyPI wheel / sdist** — GitHub signed provenance attestation:",
+              "```bash",
+              f"gh attestation verify nanodns-{version}-py3-none-any.whl --repo {repo}",
+              "```",
+              "",
+              "**OCI image** — GitHub signed provenance attestation:",
+              "```bash",
+              f"gh attestation verify oci://{image}:{version} --repo {repo}",
+              "```",
+              "",
+              "**OCI image** — Cosign keyless signature (Sigstore):",
+              "```bash",
+              f"cosign verify \\",
+              f'  --certificate-identity-regexp="https://github.com/{repo}/.github/workflows/release.yml@refs/tags/.*" \\',
+              f'  --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \\',
+              f"  {image}:{version}",
+              "```",
+              "",
+              "---",
+              "",
               f"## 🔍 Pipeline — {overall}",
               "",
               "### 📦 PyPI",
@@ -305,6 +346,7 @@ jobs:
               "| Step | Result |",
               "|---|---|",
               row("Build & push OCI image",        "docker"),
+              row("GitHub attestation (attest)",   "docker"),
               row("Runtime verification (amd64)",  "verify"),
               row("Vulnerability scan (Trivy)",    "scan"),
               row("Sign image (Cosign keyless)",   "sign"),
@@ -332,6 +374,7 @@ jobs:
               "| Step | Result |",
               "|---|---|",
               row("Build & push OCI image",        "docker"),
+              row("GitHub attestation (attest)",   "docker"),
               row("Runtime verification (amd64)",  "verify"),
               row("Vulnerability scan (Trivy)",    "scan"),
               row("Sign image (Cosign keyless)",   "sign"),
@@ -507,6 +550,25 @@ jobs:
           provenance: true
           sbom: true
 
+      # ── Attest OCI image ────────────────────────────────────────────────────
+      # Generates a GitHub-signed SLSA provenance attestation for the OCI image
+      # and uploads it to the repository's attestations store.
+      # This is separate from (and complementary to) the cosign keyless signature
+      # in the `sign` job — cosign writes to the OCI registry transparency log,
+      # while actions/attest writes to GitHub's attestations API.
+      #
+      # Verify later with:
+      #   gh attestation verify oci://ghcr.io/iyuangang/nanodns:latest \
+      #     --repo iyuangang/nanodns
+      - name: Attest OCI image provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name:   ${{ env.GHCR_IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          # Push the attestation bundle into the GHCR OCI registry so it is
+          # co-located with the image and discoverable by `cosign verify-attestation`.
+          push-to-registry: true
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 8️⃣  VERIFY DOCKER RUNTIME  (amd64)
@@ -676,7 +738,7 @@ jobs:
             --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
             ${{ env.GHCR_IMAGE }}@${{ needs.build-docker.outputs.digest }}
 
-      - name: Verify SLSA provenance
+      - name: Verify SLSA provenance (docker/build-push-action)
         run: |
           cosign verify-attestation \
             --type slsaprovenance02 \
@@ -685,6 +747,19 @@ jobs:
             ${{ env.GHCR_IMAGE }}@${{ needs.build-docker.outputs.digest }} \
             && echo "provenance OK" \
             || echo "WARNING: provenance attestation not found in Sigstore (non-fatal)"
+
+      # ── GitHub Attestation verification ─────────────────────────────────────
+      # Verifies the provenance attestation written by actions/attest-build-provenance
+      # in the build-docker job.  Uses the `gh` CLI which reads from GitHub's
+      # attestations API (independent of the Sigstore transparency log).
+      - name: Verify GitHub attestation (OCI image)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh attestation verify \
+            oci://${{ env.GHCR_IMAGE }}@${{ needs.build-docker.outputs.digest }} \
+            --repo ${{ github.repository }}
+          echo "✅ GitHub attestation verified for OCI image"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
