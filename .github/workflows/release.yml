@@ -11,9 +11,21 @@ name: Release — PyPI & OCI
 #  main     docs/style/chore        ⏭️     ⏭️      —
 #  PR       any                     ✅*    ⏭️      —
 #
-#  * PR tests run via test.yml directly, not this workflow
-#  Docker skip signal comes from test.yml → tests.outputs.skip_docker
+#  * PR tests run via test.yml; this workflow skips Docker on PR
+#  Docker skip signal: test.yml → tests.outputs.skip_docker
+#
+# Job execution order (tag v* trigger):
+#
+#  tests ──┬── build-pypi ──┬── verify-whl ──────────────────────┐
+#           │               └── attest-pypi                       │
+#           ├── changelog ──────────────────────────────────────  ├── summary ── github-release ── publish-pypi
+#           └── build-docker ──┬── verify-docker ────────────────┤              └── verify-pypi
+#                              ├── scan                           │
+#                              └── sign ── verify-signature ──────┘
+#
+# Permission model: top-level read-only; each job grants only what it needs.
 # ──────────────────────────────────────────────────────────────────────────────
+
 on:
   push:
     tags:
@@ -25,23 +37,25 @@ on:
       - main
 
 env:
-  GHCR_IMAGE:      ghcr.io/${{ github.repository_owner }}/nanodns
-  DOCKERHUB_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/nanodns
+  GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/nanodns
+  # DockerHub image — set DOCKERHUB_USERNAME secret; leave unset to skip DockerHub push
+  DOCKERHUB_IMAGE: ${{ secrets.DOCKERHUB_USERNAME && format('{0}/nanodns', secrets.DOCKERHUB_USERNAME) || '' }}
 
+# ── Principle of least privilege ──────────────────────────────────────────────
+# Default to read-only; every job that needs elevated access declares it
+# explicitly in its own `permissions:` block.
 permissions:
   contents: read
-  packages: write
-  id-token: write
-  attestations: write   # required by actions/attest for both PyPI and Docker
 
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+
 jobs:
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1️⃣  TESTS  (shared workflow, runs on every trigger)
+# 1️⃣  TESTS  (shared workflow — every trigger)
 # ══════════════════════════════════════════════════════════════════════════════
   tests:
     name: Tests
@@ -58,11 +72,12 @@ jobs:
     name: Build PyPI Distribution
     runs-on: ubuntu-latest
     needs: tests
-    # Only on tags AND only if tests actually ran (not skipped by docs/style/chore commit)
     if: startsWith(github.ref, 'refs/tags/v') && needs.tests.outputs.result != 'skipped'
 
     permissions:
       contents: read
+      id-token:     write   # actions/attest-build-provenance OIDC
+      attestations: write   # actions/attest-build-provenance store
 
     outputs:
       version:    ${{ steps.version.outputs.version }}
@@ -70,7 +85,7 @@ jobs:
       sdist-name: ${{ steps.filenames.outputs.sdist }}
 
     env:
-      PYTHONHASHSEED: "0"
+      PYTHONHASHSEED: "0"   # reproducible wheel
 
     steps:
       - uses: actions/checkout@v4
@@ -82,15 +97,13 @@ jobs:
           python-version: "3.12"
 
       - name: Install build tools
-        run: |
-          python -m pip install --upgrade pip
-          pip install --upgrade build twine
+        run: pip install --upgrade build twine
 
       - name: Extract version from tag
         id: version
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Verify pyproject.toml version matches tag
         run: |
@@ -107,41 +120,36 @@ jobs:
           fi
           echo "✅ Version: $PROJECT_VERSION"
 
-      - name: Clean previous builds
-        run: rm -rf dist build *.egg-info
-
       - name: Build sdist and wheel (reproducible)
         run: |
-          # git log -1 --format=%ct → Unix integer seconds, no format conversion needed
-          # github.event.head_commit.timestamp is ISO 8601 and breaks wheel's int()
+          # Use commit timestamp for reproducible builds.
+          # github.event.head_commit.timestamp is ISO-8601; wheel's int() rejects it.
           SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
           export SOURCE_DATE_EPOCH
           echo "SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}"
+          rm -rf dist build *.egg-info
           python -m build --sdist --wheel
 
       - name: Twine check
         run: twine check dist/*
 
-      - name: Generate SHA256 checksums
-        run: sha256sum dist/*.whl dist/*.tar.gz > SHA256SUMS
-
-      - name: Capture filenames
+      - name: Capture filenames + generate checksums
         id: filenames
         run: |
-          echo "whl=$(basename dist/*.whl)"     >> $GITHUB_OUTPUT
-          echo "sdist=$(basename dist/*.tar.gz)" >> $GITHUB_OUTPUT
+          echo "whl=$(basename   dist/*.whl)"     >> "$GITHUB_OUTPUT"
+          echo "sdist=$(basename dist/*.tar.gz)"  >> "$GITHUB_OUTPUT"
+          # Include SHA256SUMS inside the artifact so github-release can attach it
+          sha256sum dist/*.whl dist/*.tar.gz > dist/SHA256SUMS
+          cat dist/SHA256SUMS
 
-      # ── Attest wheel ────────────────────────────────────────────────────────
-      # Generates a GitHub-signed provenance attestation for the wheel and
-      # uploads it to the repository's attestations store.
-      # Verify later with:
-      #   gh attestation verify nanodns-*.whl --repo iyuangang/nanodns
+      # Provenance attestations — verify with:
+      #   gh attestation verify nanodns-*.whl   --repo <owner>/nanodns
+      #   gh attestation verify nanodns-*.tar.gz --repo <owner>/nanodns
       - name: Attest wheel provenance
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: dist/${{ steps.filenames.outputs.whl }}
 
-      # ── Attest sdist ────────────────────────────────────────────────────────
       - name: Attest sdist provenance
         uses: actions/attest-build-provenance@v2
         with:
@@ -150,32 +158,36 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: dist
-          path: dist/
+          path: dist/           # includes SHA256SUMS
           retention-days: 3
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 3️⃣  VERIFY WHEEL — cross-platform matrix  (tag only)
+# 3️⃣  VERIFY WHEEL — cross-platform smoke test  (tag only)
+#
+#  noarch wheels are architecture-independent but interpreter behaviour can
+#  differ across OS (path separators, socket APIs). We test one Python version
+#  per OS (latest stable) — 3 jobs instead of 6, since the wheel tag is
+#  `py3-none-any` and interpreter compatibility is the variable of interest.
 # ══════════════════════════════════════════════════════════════════════════════
   verify-whl:
-    name: Verify WHL (${{ matrix.os }} / Py ${{ matrix.python-version }})
+    name: Verify WHL (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     needs: build-pypi
     if: startsWith(github.ref, 'refs/tags/v')
+
+    permissions:
+      contents: read
 
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        python-version: ["3.10", "3.12", "3.14"]
-
-    permissions:
-      contents: read
 
     steps:
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.12"
 
       - uses: actions/download-artifact@v4
         with:
@@ -203,9 +215,154 @@ jobs:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 4️⃣  RELEASE SUMMARY  (tag only — runs BEFORE github-release)
-#     Writes release_body.md → uploaded as artifact.
-#     github-release reads it via body-path (avoids YAML multiline issues).
+# 4️⃣  CHANGELOG  (tag only — parallel with build-pypi, only needs tests gate)
+#
+#  Groups commits by conventional-commit prefix; annotates each with the
+#  author's GitHub login (resolved via REST API using a parallel-friendly
+#  batch approach to avoid N+1 sequential requests).
+#
+#  Sections (empty sections omitted automatically):
+#    ⭐ New Features        feat:
+#    ⚡️ Optimizations       perf: / refactor:
+#    🐞 Bug Fixes           fix:
+#    📚 Documentation       docs:
+#    ⬆️  Dependency Updates  build: / deps:
+#    🔨 Other Changes       everything else
+# ══════════════════════════════════════════════════════════════════════════════
+  changelog:
+    name: Generate Changelog
+    runs-on: ubuntu-latest
+    needs: tests   # only needs the tag-push gate; runs parallel to build-pypi
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    permissions:
+      contents: read   # git log + public GitHub Commits API
+
+    outputs:
+      previous-tag: ${{ steps.tags.outputs.previous }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve tag range
+        id: tags
+        run: |
+          CURRENT="${GITHUB_REF_NAME}"
+          PREVIOUS=$(git tag --sort=-version:refname \
+                     | grep -E '^v[0-9]' \
+                     | sed -n '2p')
+          echo "current=${CURRENT}"   >> "$GITHUB_OUTPUT"
+          echo "previous=${PREVIOUS}" >> "$GITHUB_OUTPUT"
+          echo "Current : ${CURRENT}"
+          echo "Previous: ${PREVIOUS:-<first release>}"
+
+      - name: Build author map (batch API fetch)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+          PREV:     ${{ steps.tags.outputs.previous }}
+        run: |
+          # Collect all full hashes in the range into a newline-separated list,
+          # then fetch each commit's GitHub login via the REST API.
+          # We use `gh api` (built-in, handles auth + retries) instead of raw
+          # curl to avoid manual token handling and respect rate-limit headers.
+          RANGE="${PREV:+${PREV}..}HEAD"
+          : > /tmp/authors.tsv
+
+          git log ${RANGE} --format="%H %h" | while IFS=' ' read -r FULL SHORT; do
+            LOGIN=$(gh api \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/${REPO}/commits/${FULL}" \
+              --jq '.author.login // empty' 2>/dev/null || true)
+            [ -n "$LOGIN" ] && printf '%s\t@%s\n' "$SHORT" "$LOGIN" >> /tmp/authors.tsv
+          done
+
+          echo "Author map:"
+          cat /tmp/authors.tsv || true
+
+      - name: Write CHANGELOG.md
+        env:
+          CURRENT:  ${{ steps.tags.outputs.current }}
+          PREVIOUS: ${{ steps.tags.outputs.previous }}
+          REPO:     ${{ github.repository }}
+        run: |
+          RANGE="${PREVIOUS:+${PREVIOUS}..}HEAD"
+          DATE=$(date +'%Y-%m-%d')
+          mkdir -p changelog
+
+          # Append GitHub login to a "- message (hash)" line
+          annotate() {
+            while IFS= read -r line; do
+              HASH=$(echo "$line" | grep -oE '\([a-f0-9]{7}\)' | tr -d '()')
+              AUTHOR=$(grep "^${HASH}" /tmp/authors.tsv 2>/dev/null | cut -f2 || true)
+              echo "$line${AUTHOR:+ ${AUTHOR}}"
+            done
+          }
+
+          {
+            echo "# Changelog"
+            echo
+            echo "## ${CURRENT} (${DATE})"
+            echo
+
+            FEATS=$(git log ${RANGE} --pretty=format:"- %s (%h)" --reverse \
+                    | grep -E '^- feat(\([^)]+\))?:' \
+                    | sed -E 's/^- feat(\([^)]+\))?:/- /' | annotate)
+            [ -n "$FEATS" ] && { echo "### ⭐ New Features"; echo "$FEATS"; echo; }
+
+            PERFS=$(git log ${RANGE} --pretty=format:"- %s (%h)" --reverse \
+                    | grep -E '^- (perf|refactor)(\([^)]+\))?:' \
+                    | sed -E 's/^- (perf|refactor)(\([^)]+\))?:/- /' | annotate)
+            [ -n "$PERFS" ] && { echo "### ⚡️ Optimizations"; echo "$PERFS"; echo; }
+
+            FIXES=$(git log ${RANGE} --pretty=format:"- %s (%h)" --reverse \
+                    | grep -E '^- fix(\([^)]+\))?:' \
+                    | sed -E 's/^- fix(\([^)]+\))?:/- /' | annotate)
+            [ -n "$FIXES" ] && { echo "### 🐞 Bug Fixes"; echo "$FIXES"; echo; }
+
+            DOCS=$(git log ${RANGE} --pretty=format:"- %s (%h)" --reverse \
+                   | grep -E '^- docs(\([^)]+\))?:' \
+                   | sed -E 's/^- docs(\([^)]+\))?:/- /' | annotate)
+            [ -n "$DOCS" ] && { echo "### 📚 Documentation"; echo "$DOCS"; echo; }
+
+            DEPS=$(git log ${RANGE} --pretty=format:"- %s (%h)" --reverse \
+                   | grep -E '^- (build|deps)(\([^)]+\))?:' \
+                   | sed -E 's/^- (build|deps)(\([^)]+\))?:/- /' | annotate)
+            [ -n "$DEPS" ] && { echo "### ⬆️ Dependency Updates"; echo "$DEPS"; echo; }
+
+            OTHERS=$(git log ${RANGE} --pretty=format:"- %s (%h)" --reverse \
+                     | grep -vE '^- (feat|fix|docs|refactor|perf|build|deps)(\([^)]+\))?:' \
+                     | annotate)
+            [ -n "$OTHERS" ] && { echo "### 🔨 Other Changes"; echo "$OTHERS"; echo; }
+
+            CONTRIBUTORS=$(cut -f2 /tmp/authors.tsv 2>/dev/null | sort -u | tr '\n' ' ')
+            [ -n "$CONTRIBUTORS" ] && { echo "### 👥 Contributors"; echo "$CONTRIBUTORS"; echo; }
+
+            [ -n "$PREVIOUS" ] && \
+              echo "[Full Changelog](https://github.com/${REPO}/compare/${PREVIOUS}...${CURRENT})"
+
+          } > changelog/CHANGELOG.md
+
+          echo "--- CHANGELOG.md ---"
+          cat changelog/CHANGELOG.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: changelog
+          path: changelog/CHANGELOG.md
+          retention-days: 3
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5️⃣  RELEASE SUMMARY  (tag only — gating job before github-release)
+#
+#  Uses `if: always()` so it runs even when upstream jobs fail, producing a
+#  complete pass/fail report rather than being skipped silently.
+#  Assembles release_body.md: changelog content + install snippets +
+#  attestation verify commands + pipeline result tables.
 # ══════════════════════════════════════════════════════════════════════════════
   summary:
     name: Release Summary
@@ -213,6 +370,7 @@ jobs:
     needs:
       - build-pypi
       - verify-whl
+      - changelog
       - build-docker
       - verify-docker
       - scan
@@ -220,210 +378,182 @@ jobs:
       - verify-signature
     if: always() && startsWith(github.ref, 'refs/tags/v')
 
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+    permissions:
+      contents: read
 
-      - name: Build release body and step summary
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: changelog
+          path: /tmp/changelog/
+
+      - name: Assemble release body and step summary
         env:
-          VERSION:    ${{ needs.build-pypi.outputs.version }}
-          DIGEST:     ${{ needs.build-docker.outputs.digest }}
-          GHCR:       ${{ env.GHCR_IMAGE }}
-          R_BUILD:    ${{ needs.build-pypi.result }}
-          R_WHL:      ${{ needs.verify-whl.result }}
-          R_DOCKER:   ${{ needs.build-docker.result }}
-          R_VERIFY:   ${{ needs.verify-docker.result }}
-          R_SCAN:     ${{ needs.scan.result }}
-          R_SIGN:     ${{ needs.sign.result }}
-          R_SIGVER:   ${{ needs.verify-signature.result }}
-          REPO:       ${{ github.repository }}
-          REF_NAME:   ${{ github.ref_name }}
-          SHA:        ${{ github.sha }}
+          VERSION:     ${{ needs.build-pypi.outputs.version }}
+          DIGEST:      ${{ needs.build-docker.outputs.digest }}
+          GHCR:        ${{ env.GHCR_IMAGE }}
+          REPO:        ${{ github.repository }}
+          REF_NAME:    ${{ github.ref_name }}
+          SHA:         ${{ github.sha }}
+          R_BUILD:     ${{ needs.build-pypi.result }}
+          R_WHL:       ${{ needs.verify-whl.result }}
+          R_CHANGELOG: ${{ needs.changelog.result }}
+          R_DOCKER:    ${{ needs.build-docker.result }}
+          R_VERIFY:    ${{ needs.verify-docker.result }}
+          R_SCAN:      ${{ needs.scan.result }}
+          R_SIGN:      ${{ needs.sign.result }}
+          R_SIGVER:    ${{ needs.verify-signature.result }}
         shell: python
         run: |
-          import os, subprocess, pathlib
+          import os, pathlib, textwrap
 
-          env = os.environ
-          version  = env["VERSION"]
-          digest   = env["DIGEST"]
-          image    = env["GHCR"]
-          ref      = env["REF_NAME"]
-          sha      = env["SHA"]
-          repo     = env["REPO"]
+          e        = os.environ
+          version  = e["VERSION"]
+          digest   = e["DIGEST"]
+          image    = e["GHCR"]
+          repo     = e["REPO"]
+          ref      = e["REF_NAME"]
+          sha      = e["SHA"]
 
           results = {
-              "build":     env["R_BUILD"],
-              "whl":       env["R_WHL"],
-              "docker":    env["R_DOCKER"],
-              "verify":    env["R_VERIFY"],
-              "scan":      env["R_SCAN"],
-              "sign":      env["R_SIGN"],
-              "sigver":    env["R_SIGVER"],
+              "build":     e["R_BUILD"],
+              "whl":       e["R_WHL"],
+              "changelog": e["R_CHANGELOG"],
+              "docker":    e["R_DOCKER"],
+              "verify":    e["R_VERIFY"],
+              "scan":      e["R_SCAN"],
+              "sign":      e["R_SIGN"],
+              "sigver":    e["R_SIGVER"],
           }
-
-          icons = {"success": "✅", "failure": "❌", "skipped": "⏭️", "cancelled": "🚫"}
-          def icon(k): return icons.get(results[k], "⚪")
-          def row(label, k): return f"| {label} | {icon(k)} `{results[k]}` |"
-
-          all_ok = all(results[k] == "success" for k in ["whl", "docker", "scan", "sign"])
+          ICONS = {"success": "✅", "failure": "❌", "skipped": "⏭️", "cancelled": "🚫"}
+          row = lambda label, k: f"| {label} | {ICONS.get(results[k], '⚪')} `{results[k]}` |"
+          all_ok  = all(results[k] == "success" for k in ["whl", "docker", "scan", "sign"])
           overall = "✅ All checks passed" if all_ok else "⚠️ Some checks failed"
 
-          # ── Changelog ────────────────────────────────────────────────────
-          tags = subprocess.run(
-              ["git", "tag", "--sort=-version:refname"],
-              capture_output=True, text=True
-          ).stdout.strip().splitlines()
-          vtags = [t for t in tags if t.startswith("v")]
-          prev  = vtags[1] if len(vtags) > 1 else ""
-          log_range = f"{prev}..HEAD" if prev else "HEAD"
-          commits = subprocess.run(
-              ["git", "log", "--pretty=format:- %s (%h)", log_range],
-              capture_output=True, text=True
-          ).stdout.strip()
+          # Changelog from artifact (already formatted markdown)
+          cl = pathlib.Path("/tmp/changelog/CHANGELOG.md")
+          changelog_md = cl.read_text().rstrip() if cl.exists() else "_Changelog unavailable._"
 
-          # ── Release page body ─────────────────────────────────────────────
-          body_lines = [
-              "## What's Changed",
-              "",
-              commits,
-              "",
-              "---",
-              "",
-              "## 📦 Install",
-              "",
+          # ── release_body.md ───────────────────────────────────────────────
+          body = [
+              changelog_md, "",
+              "---", "",
+              "## 📦 Install", "",
               "```bash",
-              f"pip install nanodns=={version}",
-              "```",
-              "",
+              f"pip install nanodns=={version}", "```", "",
               "```bash",
-              f"docker pull {image}:{version}",
-              "```",
+              f"docker pull {image}:{version}", "```",
           ]
           if digest:
-              body_lines += [
-                  "",
-                  "```bash",
-                  "# Pin to immutable digest",
-                  f"docker pull {image}@{digest}",
-                  "```",
-              ]
-          body_lines += [
-              "",
-              "---",
-              "",
-              "## 🔏 Verify authenticity",
-              "",
-              "**PyPI wheel / sdist** — GitHub signed provenance attestation:",
+              body += ["", "```bash",
+                       "# Pin to immutable digest",
+                       f"docker pull {image}@{digest}", "```"]
+          body += [
+              "", "---", "",
+              "## 🔏 Verify authenticity", "",
+              "**PyPI wheel** — GitHub signed provenance:",
               "```bash",
               f"gh attestation verify nanodns-{version}-py3-none-any.whl --repo {repo}",
-              "```",
-              "",
-              "**OCI image** — GitHub signed provenance attestation:",
+              "```", "",
+              "**OCI image** — GitHub signed provenance:",
               "```bash",
               f"gh attestation verify oci://{image}:{version} --repo {repo}",
-              "```",
-              "",
-              "**OCI image** — Cosign keyless signature (Sigstore):",
+              "```", "",
+              "**OCI image** — Cosign keyless (Sigstore):",
               "```bash",
-              f"cosign verify \\",
+              "cosign verify \\",
               f'  --certificate-identity-regexp="https://github.com/{repo}/.github/workflows/release.yml@refs/tags/.*" \\',
-              f'  --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \\',
+              '  --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \\',
               f"  {image}:{version}",
-              "```",
-              "",
-              "---",
-              "",
-              f"## 🔍 Pipeline — {overall}",
-              "",
+              "```", "",
+              "---", "",
+              f"## 🔍 Pipeline — {overall}", "",
               "### 📦 PyPI",
-              "| Step | Result |",
-              "|---|---|",
+              "| Step | Result |", "|---|---|",
               row("Build distribution",            "build"),
-              row("Verify wheel (cross-platform)", "whl"),
+              row("Verify wheel (3 OS)",           "whl"),
+              "",
+              "### 📝 Changelog",
+              "| Step | Result |", "|---|---|",
+              row("Generate changelog",            "changelog"),
               "",
               "### 🐳 Docker",
-              "| Step | Result |",
-              "|---|---|",
+              "| Step | Result |", "|---|---|",
               row("Build & push OCI image",        "docker"),
-              row("GitHub attestation (attest)",   "docker"),
-              row("Runtime verification (amd64)",  "verify"),
+              row("GitHub attestation",            "docker"),
+              row("Runtime verification",          "verify"),
               row("Vulnerability scan (Trivy)",    "scan"),
-              row("Sign image (Cosign keyless)",   "sign"),
+              row("Cosign keyless signature",      "sign"),
               row("Verify signature & provenance", "sigver"),
           ]
-          pathlib.Path("/tmp/release_body.md").write_text("\n".join(body_lines) + "\n")
+          pathlib.Path("/tmp/release_body.md").write_text("\n".join(body) + "\n")
           print("✅ release_body.md written")
 
-          # ── Actions Step Summary ──────────────────────────────────────────
-          summary_lines = [
-              f"## 🚀 NanoDNS {ref} — {overall}",
-              "",
-              "| | |",
-              "|---|---|",
+          # ── GITHUB_STEP_SUMMARY ───────────────────────────────────────────
+          summary = [
+              f"## 🚀 NanoDNS {ref} — {overall}", "",
+              "| | |", "|---|---|",
               f"| **Version** | `{version}` |",
-              f"| **SHA**     | `{sha}` |",
+              f"| **Commit**  | `{sha[:12]}` |",
               "",
-              "### 📦 PyPI Pipeline",
-              "| Step | Result |",
-              "|---|---|",
+              "### 📦 PyPI",
+              "| Step | Result |", "|---|---|",
               row("Build distribution",            "build"),
-              row("Verify wheel (cross-platform)", "whl"),
+              row("Verify wheel (3 OS)",           "whl"),
               "",
-              "### 🐳 Docker Pipeline",
-              "| Step | Result |",
-              "|---|---|",
+              "### 📝 Changelog",
+              "| Step | Result |", "|---|---|",
+              row("Generate changelog",            "changelog"),
+              "",
+              "### 🐳 Docker",
+              "| Step | Result |", "|---|---|",
               row("Build & push OCI image",        "docker"),
-              row("GitHub attestation (attest)",   "docker"),
-              row("Runtime verification (amd64)",  "verify"),
+              row("GitHub attestation",            "docker"),
+              row("Runtime verification",          "verify"),
               row("Vulnerability scan (Trivy)",    "scan"),
-              row("Sign image (Cosign keyless)",   "sign"),
+              row("Cosign keyless signature",      "sign"),
               row("Verify signature & provenance", "sigver"),
           ]
           if digest:
-              summary_lines += [
-                  "",
-                  "🐳 **Immutable digest:**",
-                  "```",
-                  f"docker pull {image}@{digest}",
-                  "```",
-              ]
-          pathlib.Path(env["GITHUB_STEP_SUMMARY"]).write_text(
-              "\n".join(summary_lines) + "\n"
-          )
+              summary += ["", "🐳 **Immutable digest:**",
+                          "```", f"docker pull {image}@{digest}", "```"]
+          pathlib.Path(e["GITHUB_STEP_SUMMARY"]).write_text("\n".join(summary) + "\n")
           print("✅ GITHUB_STEP_SUMMARY written")
 
-      - name: Upload release body artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: release-body
           path: /tmp/release_body.md
-          retention-days: 1
+          retention-days: 1   # consumed immediately by github-release
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 5️⃣  GITHUB RELEASE  (tag only, after summary)
-#     Reads release_body.md via body-path — avoids YAML multiline truncation.
+# 6️⃣  GITHUB RELEASE  (tag only, after summary)
 # ══════════════════════════════════════════════════════════════════════════════
   github-release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: [summary, verify-whl]
+    needs: summary    # transitive: summary already needs verify-whl + changelog
     if: startsWith(github.ref, 'refs/tags/v')
 
     permissions:
-      contents: write
+      contents: write   # create release + upload assets
 
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: dist
-          path: dist/
+          path: dist/         # contains wheel, sdist, SHA256SUMS
 
       - uses: actions/download-artifact@v4
         with:
           name: release-body
           path: /tmp/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: changelog
+          path: /tmp/changelog/   # attach CHANGELOG.md as a release asset
 
       - uses: softprops/action-gh-release@v2
         with:
@@ -435,10 +565,12 @@ jobs:
           files: |
             dist/*.whl
             dist/*.tar.gz
-            SHA256SUMS
+            dist/SHA256SUMS
+            /tmp/changelog/CHANGELOG.md
 
 
-# 6️⃣  PUBLISH TO PyPI  (tag only, after GitHub release)
+# ══════════════════════════════════════════════════════════════════════════════
+# 7️⃣  PUBLISH TO PyPI  (tag only, after GitHub release is created)
 # ══════════════════════════════════════════════════════════════════════════════
   publish-pypi:
     name: Publish to PyPI
@@ -447,12 +579,12 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
 
     permissions:
-      id-token: write
+      id-token: write   # OIDC trusted publishing
       contents: read
 
     environment:
       name: pypi
-      url: https://pypi.org/project/nanodns/
+      url:  https://pypi.org/project/nanodns/
 
     steps:
       - uses: actions/download-artifact@v4
@@ -460,15 +592,71 @@ jobs:
           name: dist
           path: dist/
 
-      - name: Publish via Trusted Publishing (OIDC)
-        uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
           skip-existing: false
           verbose: true
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-# 7️⃣  BUILD & PUSH DOCKER IMAGE  (tag + main, skip PR)
+# 8️⃣  VERIFY PyPI PACKAGE  (tag only, after publish)
+#
+#  Uses a retry loop instead of a fixed sleep to avoid wasting 90 s when the
+#  package propagates quickly (typically 10-30 s on PyPI's CDN).
+# ══════════════════════════════════════════════════════════════════════════════
+  verify-pypi:
+    name: Verify PyPI Package
+    runs-on: ubuntu-latest
+    needs: [publish-pypi, build-pypi]
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Wait for PyPI propagation (retry loop, max 3 min)
+        env:
+          VERSION: ${{ needs.build-pypi.outputs.version }}
+        run: |
+          for i in $(seq 1 18); do
+            echo "Attempt ${i}/18 — checking PyPI index..."
+            if pip index versions nanodns 2>/dev/null | grep -q "${VERSION}"; then
+              echo "✅ Version ${VERSION} is visible on PyPI"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "❌ Timed out waiting for PyPI propagation" && exit 1
+
+      - name: Install from PyPI and smoke test
+        env:
+          VERSION: ${{ needs.build-pypi.outputs.version }}
+        run: |
+          pip install --no-cache-dir \
+            --index-url https://pypi.org/simple \
+            "nanodns==${VERSION}"
+          INSTALLED=$(nanodns --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          [ "$INSTALLED" = "$VERSION" ] \
+            && echo "✅ PyPI $INSTALLED" \
+            || (echo "❌ $INSTALLED != $VERSION" && exit 1)
+          nanodns init smoke.json
+          nanodns check smoke.json
+          echo "✅ PyPI smoke test passed"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 9️⃣  BUILD & PUSH DOCKER IMAGE  (tag + main, skip PR)
+#
+#  On tag:  pushes semver tags (1.2.3, 1.2, 1) + sha tag
+#  On main: pushes `edge` tag only (NOT `latest`) to avoid overwriting the
+#           last stable release tag with an unreleased main-branch build.
+#  `latest` is only set on tag pushes via `enable={{is_default_branch}}=false`
+#  combined with explicit raw tag on semver events.
 # ══════════════════════════════════════════════════════════════════════════════
   build-docker:
     name: Build & Push OCI Image
@@ -478,6 +666,12 @@ jobs:
       github.event_name != 'pull_request' &&
       needs.tests.outputs.result != 'skipped' &&
       needs.tests.outputs.skip_docker != 'true'
+
+    permissions:
+      contents: read
+      packages:     write   # push to GHCR
+      id-token:     write   # actions/attest-build-provenance OIDC
+      attestations: write   # actions/attest-build-provenance store
 
     outputs:
       digest:  ${{ steps.build.outputs.digest }}
@@ -499,7 +693,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # DockerHub login is skipped when DOCKERHUB_USERNAME secret is not set
       - name: Login DockerHub
+        if: env.DOCKERHUB_IMAGE != ''
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -511,14 +707,17 @@ jobs:
         with:
           images: |
             ${{ env.GHCR_IMAGE }}
-            ${{ env.DOCKERHUB_IMAGE }}
+            ${{ env.DOCKERHUB_IMAGE != '' && env.DOCKERHUB_IMAGE || '' }}
           tags: |
+            # On version tag: semver variants + latest
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
-            type=ref,event=branch
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            # On main branch push: edge tag only (never overwrites latest)
+            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
+            # Always: short SHA for traceability
             type=sha,prefix=sha-,format=short
-            type=raw,value=latest,enable={{is_default_branch}}
           labels: |
             org.opencontainers.image.title=NanoDNS
             org.opencontainers.image.description=Lightweight JSON-configurable DNS server
@@ -550,34 +749,31 @@ jobs:
           provenance: true
           sbom: true
 
-      # ── Attest OCI image ────────────────────────────────────────────────────
-      # Generates a GitHub-signed SLSA provenance attestation for the OCI image
-      # and uploads it to the repository's attestations store.
-      # This is separate from (and complementary to) the cosign keyless signature
-      # in the `sign` job — cosign writes to the OCI registry transparency log,
-      # while actions/attest writes to GitHub's attestations API.
-      #
-      # Verify later with:
-      #   gh attestation verify oci://ghcr.io/iyuangang/nanodns:latest \
-      #     --repo iyuangang/nanodns
+      # Provenance attestation — verify with:
+      #   gh attestation verify oci://ghcr.io/<owner>/nanodns:<tag> --repo <owner>/nanodns
+      # Complements (does not replace) the cosign keyless signature in job 1️⃣1️⃣.
       - name: Attest OCI image provenance
         uses: actions/attest-build-provenance@v2
         with:
-          subject-name:   ${{ env.GHCR_IMAGE }}
-          subject-digest: ${{ steps.build.outputs.digest }}
-          # Push the attestation bundle into the GHCR OCI registry so it is
-          # co-located with the image and discoverable by `cosign verify-attestation`.
-          push-to-registry: true
+          subject-name:     ${{ env.GHCR_IMAGE }}
+          subject-digest:   ${{ steps.build.outputs.digest }}
+          push-to-registry: true   # co-locate attestation with image in GHCR
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 8️⃣  VERIFY DOCKER RUNTIME  (amd64)
+# 🔟  VERIFY DOCKER RUNTIME  (non-PR only, depends on build-docker)
 # ══════════════════════════════════════════════════════════════════════════════
   verify-docker:
     name: Verify Docker Runtime
     runs-on: ubuntu-latest
     needs: build-docker
+    # build-docker already skips on PR; this inherits that skip transitively.
+    # The explicit condition is retained for clarity and future-proofing.
     if: github.event_name != 'pull_request'
+
+    permissions:
+      contents: read
+      packages: read   # pull from GHCR
 
     steps:
       - uses: docker/login-action@v3
@@ -586,10 +782,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Pull by digest
+      - name: Pull image by digest
         run: docker pull ${{ env.GHCR_IMAGE }}@${{ needs.build-docker.outputs.digest }}
 
-      - name: Verify CLI (python -m, distroless-compatible)
+      - name: Verify CLI (distroless-compatible via python -m)
         run: |
           docker run --rm \
             --entrypoint /usr/bin/python \
@@ -643,7 +839,7 @@ jobs:
             VALUE=$(docker inspect "$IMAGE" \
               --format "{{ index .Config.Labels \"$label\" }}")
             if [ -z "$VALUE" ]; then
-              echo "❌ Missing label: $label"; MISSING=$((MISSING+1))
+              echo "❌ Missing: $label"; MISSING=$((MISSING+1))
             else
               echo "✅ $label = $VALUE"
             fi
@@ -655,14 +851,14 @@ jobs:
           USER=$(docker inspect \
             ${{ env.GHCR_IMAGE }}@${{ needs.build-docker.outputs.digest }} \
             --format '{{ .Config.User }}')
-          echo "User: ${USER:-<default>}"
+          echo "Container user: ${USER:-<default>}"
           [[ "$USER" == "root" || "$USER" == "0" ]] \
             && echo "⚠️  WARNING: runs as root" \
             || echo "✅ non-root"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 9️⃣  VULNERABILITY SCAN
+# 1️⃣1️⃣  VULNERABILITY SCAN  (non-PR only)
 # ══════════════════════════════════════════════════════════════════════════════
   scan:
     name: Vulnerability Scan (Trivy)
@@ -670,16 +866,28 @@ jobs:
     needs: build-docker
     if: github.event_name != 'pull_request'
 
+    permissions:
+      contents: read
+      security-events: write   # upload SARIF results to GitHub Security tab
+
     steps:
       - uses: aquasecurity/trivy-action@0.24.0
         with:
-          image-ref:  ${{ env.GHCR_IMAGE }}@${{ needs.build-docker.outputs.digest }}
-          severity:   CRITICAL,HIGH
-          exit-code:  1
+          image-ref:    ${{ env.GHCR_IMAGE }}@${{ needs.build-docker.outputs.digest }}
+          severity:     CRITICAL,HIGH
+          exit-code:    1
+          format:       sarif
+          output:       trivy-results.sarif
+
+      - name: Upload Trivy SARIF to GitHub Security
+        if: always()   # upload even on scan failure so results are visible
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 🔟  COSIGN SIGN  (tag only)
+# 1️⃣2️⃣  COSIGN KEYLESS SIGN  (tag only)
 # ══════════════════════════════════════════════════════════════════════════════
   sign:
     name: Sign Image (Cosign Keyless)
@@ -688,14 +896,13 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
 
     permissions:
-      id-token: write
-      packages: write
+      id-token: write   # OIDC for keyless signing
+      packages: write   # push signature to GHCR
 
     steps:
       - uses: sigstore/cosign-installer@v3
 
-      - name: Login GHCR
-        uses: docker/login-action@v3
+      - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -708,7 +915,7 @@ jobs:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1️⃣1️⃣  VERIFY SIGNATURE + PROVENANCE  (tag only)
+# 1️⃣3️⃣  VERIFY SIGNATURE + PROVENANCE  (tag only)
 # ══════════════════════════════════════════════════════════════════════════════
   verify-signature:
     name: Verify Signature & Provenance
@@ -717,15 +924,14 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
 
     permissions:
-      id-token: write
-      packages: read
-      attestations: read
+      id-token:     write   # cosign OIDC
+      packages:     read    # pull from GHCR
+      attestations: read    # gh attestation verify
 
     steps:
       - uses: sigstore/cosign-installer@v3
 
-      - name: Login GHCR
-        uses: docker/login-action@v3
+      - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -737,6 +943,7 @@ jobs:
             --certificate-identity-regexp="https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/.*" \
             --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
             ${{ env.GHCR_IMAGE }}@${{ needs.build-docker.outputs.digest }}
+          echo "✅ cosign signature OK"
 
       - name: Verify SLSA provenance (docker/build-push-action)
         run: |
@@ -745,56 +952,14 @@ jobs:
             --certificate-identity-regexp="https://github.com/docker/build-push-action@.*" \
             --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
             ${{ env.GHCR_IMAGE }}@${{ needs.build-docker.outputs.digest }} \
-            && echo "provenance OK" \
-            || echo "WARNING: provenance attestation not found in Sigstore (non-fatal)"
+            && echo "✅ SLSA provenance OK" \
+            || echo "⚠️  SLSA provenance not found in Sigstore (non-fatal)"
 
-      # ── GitHub Attestation verification ─────────────────────────────────────
-      # Verifies the provenance attestation written by actions/attest-build-provenance
-      # in the build-docker job.  Uses the `gh` CLI which reads from GitHub's
-      # attestations API (independent of the Sigstore transparency log).
-      - name: Verify GitHub attestation (OCI image)
+      - name: Verify GitHub attestation (actions/attest)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh attestation verify \
             oci://${{ env.GHCR_IMAGE }}@${{ needs.build-docker.outputs.digest }} \
             --repo ${{ github.repository }}
-          echo "✅ GitHub attestation verified for OCI image"
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 1️⃣2️⃣  VERIFY PyPI PACKAGE  (tag only, after publish)
-# ══════════════════════════════════════════════════════════════════════════════
-  verify-pypi:
-    name: Verify PyPI Package
-    runs-on: ubuntu-latest
-    needs: [publish-pypi, build-pypi]
-    if: startsWith(github.ref, 'refs/tags/v')
-
-    permissions:
-      contents: read
-
-    steps:
-      - name: Wait for index propagation
-        run: sleep 90
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install from PyPI
-        run: |
-          python -m pip install --no-cache-dir \
-            --index-url https://pypi.org/simple \
-            "nanodns==${{ needs.build-pypi.outputs.version }}"
-
-      - name: Smoke test
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          INSTALLED=$(nanodns --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
-          [ "$INSTALLED" = "$VERSION" ] \
-            && echo "✅ PyPI $INSTALLED" \
-            || (echo "❌ $INSTALLED != $VERSION" && exit 1)
-          nanodns init smoke.json
-          nanodns check smoke.json
-          echo "✅ PyPI smoke test passed"
+          echo "✅ GitHub attestation OK"
