@@ -138,9 +138,11 @@ jobs:
         run: |
           echo "whl=$(basename   dist/*.whl)"     >> "$GITHUB_OUTPUT"
           echo "sdist=$(basename dist/*.tar.gz)"  >> "$GITHUB_OUTPUT"
-          # Include SHA256SUMS inside the artifact so github-release can attach it
-          sha256sum dist/*.whl dist/*.tar.gz > dist/SHA256SUMS
-          cat dist/SHA256SUMS
+          # Write SHA256SUMS to workspace root, NOT inside dist/.
+          # pypa/gh-action-pypi-publish scans everything in packages-dir and
+          # rejects non-distribution files (SHA256SUMS causes InvalidDistribution).
+          sha256sum dist/*.whl dist/*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
 
       # Provenance attestations — verify with:
       #   gh attestation verify nanodns-*.whl   --repo <owner>/nanodns
@@ -155,10 +157,18 @@ jobs:
         with:
           subject-path: dist/${{ steps.filenames.outputs.sdist }}
 
+      # dist/ artifact: only wheel + sdist (published to PyPI as-is)
       - uses: actions/upload-artifact@v4
         with:
           name: dist
-          path: dist/           # includes SHA256SUMS
+          path: dist/
+          retention-days: 3
+
+      # checksums artifact: SHA256SUMS kept separate from PyPI payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: checksums
+          path: SHA256SUMS
           retention-days: 3
 
 
@@ -543,7 +553,12 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: dist
-          path: dist/         # contains wheel, sdist, SHA256SUMS
+          path: dist/           # wheel + sdist only (no SHA256SUMS)
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: checksums
+          path: checksums/      # SHA256SUMS lives here
 
       - uses: actions/download-artifact@v4
         with:
@@ -565,7 +580,7 @@ jobs:
           files: |
             dist/*.whl
             dist/*.tar.gz
-            dist/SHA256SUMS
+            checksums/SHA256SUMS
             /tmp/changelog/CHANGELOG.md
 
 
